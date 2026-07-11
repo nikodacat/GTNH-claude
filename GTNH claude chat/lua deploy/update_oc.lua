@@ -14,6 +14,7 @@ local io        = require("io")
 local os        = require("os")
 
 local DISK      = "/mnt/e10"
+local HOME      = "/home"
 local REPO_RAW  = "https://raw.githubusercontent.com/nikodacat/GTNH-claude/main/GTNH%20claude%20chat/lua%20deploy/"
 
 -- files to pull -- add new ones here as the project grows.
@@ -29,6 +30,16 @@ local FILES = {
   "config.example",
   "update_oc",
 }
+
+-- files that live in HOME instead of DISK (update_oc.lua itself lives
+-- in /home so it's easy to run from anywhere on boot; everything else
+-- stays on DISK, which has more free space)
+local HOME_FILES = { update_oc = true }
+
+local function targetPath(base, name)
+  if HOME_FILES[base] then return HOME .. "/" .. name end
+  return DISK .. "/" .. name
+end
 
 if not component.isAvailable("internet") then
   print("[FAIL] No Internet Card."); return
@@ -68,7 +79,7 @@ for _, base in ipairs(FILES) do
     print("[FAIL] " .. tostring(err or "empty response"))
     failCount = failCount + 1
   else
-    local path = DISK .. "/" .. name
+    local path = targetPath(base, name)
     local f, ferr = io.open(path, "w")
     if not f then
       print("[FAIL] couldn't write " .. path .. ": " .. tostring(ferr))
@@ -85,14 +96,4 @@ end
 print()
 print(string.format("Done. %d updated, %d failed.", okCount, failCount))
 if failCount > 0 then
-  print("[!] If fetches failed, check the repo is public and the")
-  print("    filenames in FILES still match what's on GitHub.")
-end
-
-local hasConfig = io.open(DISK .. "/config.lua", "r")
-if hasConfig then
-  hasConfig:close()
-  print("[i] config.lua left untouched, as intended.")
-else
-  print("[!] No config.lua found -- copy config.example.lua to")
-  print("    " .. DISK .. "/config.lua and set your 
+  print("[!] If fe
