@@ -37,9 +37,11 @@ local FILES = {
 -- DISK, which has more free space)
 local HOME_FILES = { update_oc = true }
 
-local function targetPath(base, name)
-  if HOME_FILES[base] then return HOME .. "/" .. base end  -- no .lua suffix
-  return DISK .. "/" .. name
+-- local files are written without the .lua suffix; the .lua suffix is
+-- only used for the GitHub fetch URL, not the on-disk name
+local function targetPath(base)
+  if HOME_FILES[base] then return HOME .. "/" .. base end
+  return DISK .. "/" .. base
 end
 
 if not component.isAvailable("internet") then
@@ -80,7 +82,7 @@ for _, base in ipairs(FILES) do
     print("[FAIL] " .. tostring(err or "empty response"))
     failCount = failCount + 1
   else
-    local path = targetPath(base, name)
+    local path = targetPath(base)
     local f, ferr = io.open(path, "w")
     if not f then
       print("[FAIL] couldn't write " .. path .. ": " .. tostring(ferr))
@@ -88,11 +90,4 @@ for _, base in ipairs(FILES) do
     else
       f:write(body)
       f:close()
-      print("OK (" .. #body .. " bytes)")
-      okCount = okCount + 1
-    end
-  end
-end
-
-print()
-print(string.format("Done. %d 
+      print("OK (" .. #body
