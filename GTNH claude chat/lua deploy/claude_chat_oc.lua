@@ -4,7 +4,7 @@
 --  Requires: Internet Card only
 -- =============================================
 
-local SERVER = "http://26.89.137.125:11434"  -- ← change to your PC's LAN IP
+local DISK = "/mnt/e10"   -- where scripts + config live
 
 -- ── libs ─────────────────────────────────────
 local component = require("component")
@@ -20,9 +20,33 @@ if not component.isAvailable("internet") then
   print("Insert one and restart.")
   io.read(); os.exit()
 end
-if SERVER:find("192.168.x.x") then
-  print("ERROR: Set SERVER to your PC's LAN IP.")
-  print("Example: http://192.168.1.5:11434")
+
+-- ── local config (NOT tracked in git) ─────────
+-- Copy config.example.lua to DISK.."/config.lua" and set your
+-- real SERVER ip there. Keeping it out of git means pulling
+-- script updates never clobbers your local server IP.
+local function loadConfig()
+  local path = DISK.."/config.lua"
+  local f = io.open(path, "r")
+  if not f then
+    print("ERROR: Missing config file: "..path)
+    print("       Copy config.example.lua to "..path)
+    print("       and set your SERVER ip there.")
+    io.read(); os.exit()
+  end
+  f:close()
+  local ok, cfg = pcall(dofile, path)
+  if not ok or type(cfg) ~= "table" or not cfg.SERVER then
+    print("ERROR: "..path.." must return a table with a SERVER field.")
+    io.read(); os.exit()
+  end
+  return cfg
+end
+
+local SERVER = loadConfig().SERVER
+if SERVER:find("YOUR_HAMACHI_IP") then
+  print("ERROR: Set SERVER in "..DISK.."/config.lua to your PC's LAN/Hamachi IP.")
+  print("Example: http://26.89.137.125:11434")
   io.read(); os.exit()
 end
 
@@ -158,35 +182,4 @@ while true do
   if not input then break end
   input = input:match("^%s*(.-)%s*$")
   if input=="" then goto continue end
-  if input:lower()=="quit" then fg(0xFFFF00); print("Bye!"); break end
-
-  history[#history+1] = {role="user", content=input}
-
-  fg(0x888888); io.write("[~] Thinking...\n"); fg(0xFFFFFF)
-
-  local raw, err = post("/chat", {messages=history, source="oc"})
-  if not raw then
-    fg(0xFF4444); print("[ERR] "..(err or "?")); fg(0xFFFFFF)
-    history[#history]=nil
-    goto continue
-  end
-
-  local reply, rerr = getReply(raw)
-  if not reply then
-    fg(0xFF4444); print("[ERR] "..(rerr or raw)); fg(0xFFFFFF)
-    history[#history]=nil
-    goto continue
-  end
-
-  -- check if server flagged CJK content
-  local hasCJK = raw:find('"has_cjk":%s*true') ~= nil
-  if hasCJK then
-    fg(0xFFAA00); print("[!] Full reply on web viewer (contains non-ASCII).")
-    fg(0xFFFFFF)
-  end
-
-  history[#history+1] = {role="assistant", content=reply}
-  printWrapped(0x00FFFF, "Claude: ", reply)
-
-  ::continue::
-e
+  if input:lower()=="quit" then fg(0xFFFF00); print("Bye!");

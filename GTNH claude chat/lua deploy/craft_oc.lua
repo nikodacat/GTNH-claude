@@ -4,14 +4,37 @@
 --  with debug logging to terminal + web viewer.
 -- =============================================
 
-local SERVER = "http://26.89.137.125:11434"
-local DISK   = "/mnt/e10"   -- where to save cache/recipes
+local DISK   = "/mnt/e10"   -- where scripts + config live
 
 local component = require("component")
 local computer  = require("computer")
 local term      = require("term")
 local io        = require("io")
 local os        = require("os")
+
+-- ── local config (NOT tracked in git) ─────────
+-- Copy config.example.lua to DISK.."/config.lua" and set your
+-- real SERVER ip there. Keeping it out of git means pulling
+-- script updates never clobbers your local server IP.
+local function loadConfig()
+  local path = DISK.."/config.lua"
+  local f = io.open(path, "r")
+  if not f then
+    print("[FAIL] Missing config file: "..path)
+    print("       Copy config.example.lua to "..path)
+    print("       and set your SERVER ip there.")
+    io.read(); os.exit()
+  end
+  f:close()
+  local ok, cfg = pcall(dofile, path)
+  if not ok or type(cfg) ~= "table" or not cfg.SERVER then
+    print("[FAIL] "..path.." must return a table with a SERVER field.")
+    io.read(); os.exit()
+  end
+  return cfg
+end
+
+local SERVER = loadConfig().SERVER
 
 -- ── debug logger ──────────────────────────────
 local debugLines = {}
@@ -72,7 +95,7 @@ end
 
 -- check SERVER set
 dbg("SERVER           : " .. SERVER)
-local serverOk = not SERVER:find("192.168.x.x")
+local serverOk = not SERVER:find("YOUR_HAMACHI_IP")
 dbg("SERVER configured: " .. tostring(serverOk))
 
 -- flush early so we get hardware info even if we crash below
@@ -548,26 +571,4 @@ while true do
     history[#history+1]={role="assistant",content=message}
 
     if hasCJK then
-      cprint(0xFFAA00,"[!] Full reply on web viewer (contains non-ASCII).")
-    end
-
-    print()
-    printWrapped(0x00FFFF,"Claude: ",message)
-    if warn and warn~="null" and warn~="" then
-      cprint(0xFFAA00,"[!] "..warn)
-    end
-
-    if action=="craft" and item and item~="null" then
-      cprint(0xFFFF00,string.format("\n[Autocraft] %s x%d",item,amount))
-      local ok,aerr=triggerAutocraft(item,amount)
-      if ok then cprint(0x00FF00,"  [+] Done!")
-      else cprint(0xFF4444,"  [!] "..(aerr or "failed")) end
-    elseif action=="explain" then
-      cprint(0xFFAA00,"\n[No pattern] Cannot autocraft — see recipe above.")
-      cprint(0x888888,"  -> Encode a pattern in ME Pattern Terminal to enable.")
-    end
-
-    flushDebug("request-"..input:sub(1,20))
-  end
-
-  ::continue:
+      cprint(0xFFA

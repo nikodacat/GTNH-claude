@@ -26,9 +26,35 @@
 local component = require("component")
 local computer  = require("computer")
 
-local SERVER = "http://26.89.137.125:11434"
+local DISK = "/mnt/e10"   -- where scripts + config live
 
 if not component.isAvailable("internet") then print("[FAIL] no internet card"); return end
+
+-- ── local config (NOT tracked in git) ─────────
+-- Copy config.example.lua to DISK.."/config.lua" and set your
+-- real SERVER ip there. Keeping it out of git means pulling
+-- script updates never clobbers your local server IP.
+local function loadConfig()
+  local path = DISK.."/config.lua"
+  local f = io.open(path, "r")
+  if not f then
+    print("[FAIL] Missing config file: "..path)
+    print("       Copy config.example.lua to "..path)
+    print("       and set your SERVER ip there.")
+    return nil
+  end
+  f:close()
+  local ok, cfg = pcall(dofile, path)
+  if not ok or type(cfg) ~= "table" or not cfg.SERVER then
+    print("[FAIL] "..path.." must return a table with a SERVER field.")
+    return nil
+  end
+  return cfg
+end
+
+local cfg = loadConfig()
+if not cfg then return end
+local SERVER = cfg.SERVER
 if not component.isAvailable("me_controller") then print("[FAIL] no me_controller"); return end
 if not component.isAvailable("me_interface") then
   print("[FAIL] no me_interface component found.")
@@ -215,27 +241,4 @@ local outId, outDmg = splitItemId(itemName)
 local ok4 = db.set(dbSlot, outId, outDmg)
 if not ok4 then print("[FAIL] database.set (output) failed"); return end
 local ok5, err5 = iface.setInterfacePatternOutput(PATTERN_INDEX, db.address, dbSlot, 1, 0)
-if not ok5 then print("[FAIL] setInterfacePatternOutput failed: "..tostring(err5)); return end
-
-print("[OK] Pattern written.")
-print()
-
--- ── verify it shows up as craftable ──
-print("Checking me.getCraftables() for confirmation (may take a moment)...")
-os.sleep(1)
-local ok6, craftables = pcall(me.getCraftables)
-local found = false
-if ok6 and craftables then
-  for _,c in ipairs(craftables) do
-    if c.name==outId then found=true; break end
-  end
-end
-if found then
-  print("[SUCCESS] "..outId.." now appears in getCraftables().")
-else
-  print("[WARN] "..outId.." not yet showing as craftable.")
-  print("       Check in-game: does the buffer ME Interface show the")
-  print("       new pattern in its GUI? Is it connected to the network")
-  print("       with enough channels, and is a Molecular Assembler or")
-  print("       Crafting CPU available for the network to use it?")
-e
+if not ok5 then print("[FAIL] setInterfacePat
