@@ -17,16 +17,17 @@ local DISK      = "/mnt/e10"
 local REPO_RAW  = "https://raw.githubusercontent.com/nikodacat/GTNH-claude/main/GTNH%20claude%20chat/lua%20deploy/"
 
 -- files to pull -- add new ones here as the project grows.
--- config.lua is deliberately NOT in this list.
+-- Just the base name, no ".lua" -- it's appended below.
+-- config is deliberately NOT in this list (config.lua stays local-only).
 local FILES = {
-  "craft_oc.lua",
-  "claude_chat_oc.lua",
-  "diag_oc.lua",
-  "lookup_item_name_oc.lua",
-  "test_craft_oc.lua",
-  "test_pattern_write_oc.lua",
-  "config.example.lua",
-  "update_oc.lua",
+  "craft_oc",
+  "claude_chat_oc",
+  "diag_oc",
+  "lookup_item_name_oc",
+  "test_craft_oc",
+  "test_pattern_write_oc",
+  "config.example",
+  "update_oc",
 }
 
 if not component.isAvailable("internet") then
@@ -59,7 +60,8 @@ print("Source: " .. REPO_RAW)
 print()
 
 local okCount, failCount = 0, 0
-for _, name in ipairs(FILES) do
+for _, base in ipairs(FILES) do
+  local name = base .. ".lua"
   io.write("  " .. name .. " ... ")
   local body, err = fetch(REPO_RAW .. name)
   if not body or body == "" then
@@ -93,6 +95,4 @@ if hasConfig then
   print("[i] config.lua left untouched, as intended.")
 else
   print("[!] No config.lua found -- copy config.example.lua to")
-  print("    " .. DISK .. "/config.lua and set your SERVER ip")
-  print("    before running craft_oc.lua / claude_chat_oc.lua.")
-end
+  print("    " .. DISK .. "/config.lua and set your 
