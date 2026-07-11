@@ -179,7 +179,7 @@ while true do
   end
 
   -- check if server flagged CJK content
-  local hasCJK = raw:find('"has_cjk":true') ~= nil
+  local hasCJK = raw:find('"has_cjk":%s*true') ~= nil
   if hasCJK then
     fg(0xFFAA00); print("[!] Full reply on web viewer (contains non-ASCII).")
     fg(0xFFFFFF)
@@ -189,4 +189,4 @@ while true do
   printWrapped(0x00FFFF, "Claude: ", reply)
 
   ::continue::
-end
+e

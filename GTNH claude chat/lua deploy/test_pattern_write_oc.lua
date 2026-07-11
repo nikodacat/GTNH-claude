@@ -151,7 +151,7 @@ print("Looking up recipe from server...")
 local encoded = itemName:gsub(":","%%3A")
 local raw, err = get("/recipe?item="..encoded)
 if not raw then print("[FAIL] server request failed: "..tostring(err)); return end
-if not raw:find('"found":true') then print("[FAIL] no recipe found for "..itemName); return end
+if not raw:find('"found":%s*true') then print("[FAIL] no recipe found for "..itemName); return end
 
 local rtype = extractStr(raw,"type")
 print("Recipe type: "..tostring(rtype))
@@ -238,4 +238,4 @@ else
   print("       new pattern in its GUI? Is it connected to the network")
   print("       with enough channels, and is a Molecular Assembler or")
   print("       Crafting CPU available for the network to use it?")
-end
+e

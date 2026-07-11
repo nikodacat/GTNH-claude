@@ -299,7 +299,7 @@ local function lookupRecipe(itemName)
   local encoded=itemName:gsub(":","%%3A")
   local raw,err=get("/recipe?item="..encoded)
   if not raw then return nil, err end
-  local found=raw:find('"found":true')~=nil
+  local found=raw:find('"found":%s*true')~=nil
   if not found then return nil,nil end
   local gridStr=raw:match('"grid":%s*(%[.-%])')
   local ingStr =raw:match('"ingredients":%s*(%[.-%])')
@@ -541,7 +541,7 @@ while true do
     local item   =extractStr(raw,"item")
     local amount =extractNum(raw,"amount")  or 1
     local warn   =extractStr(raw,"warn")
-    local hasCJK =raw:find('"has_cjk":true')~=nil
+    local hasCJK =raw:find('"has_cjk":%s*true')~=nil
 
     dbg("action="..tostring(action).." item="..tostring(item).." hasCJK="..tostring(hasCJK))
 
@@ -570,5 +570,4 @@ while true do
     flushDebug("request-"..input:sub(1,20))
   end
 
-  ::continue::
-end
+  ::continue:
