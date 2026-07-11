@@ -31,13 +31,14 @@ local FILES = {
   "update_oc",
 }
 
--- files that live in HOME instead of DISK (update_oc.lua itself lives
--- in /home so it's easy to run from anywhere on boot; everything else
--- stays on DISK, which has more free space)
+-- files that live in HOME instead of DISK (update_oc itself lives at
+-- /home/update_oc -- no .lua suffix, that's where the file already is --
+-- so it's easy to run from anywhere on boot; everything else stays on
+-- DISK, which has more free space)
 local HOME_FILES = { update_oc = true }
 
 local function targetPath(base, name)
-  if HOME_FILES[base] then return HOME .. "/" .. name end
+  if HOME_FILES[base] then return HOME .. "/" .. base end  -- no .lua suffix
   return DISK .. "/" .. name
 end
 
@@ -94,6 +95,4 @@ for _, base in ipairs(FILES) do
 end
 
 print()
-print(string.format("Done. %d updated, %d failed.", okCount, failCount))
-if failCount > 0 then
-  print("[!] If fe
+print(string.format("Done. %d 
