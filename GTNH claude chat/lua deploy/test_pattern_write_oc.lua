@@ -404,6 +404,7 @@ for _,ie in ipairs(ingredientEntries) do
     flushDebug("resolve-fail")
     return
   end
+  dbg("    -> writing "..id..":"..dmg.." (count="..(ie.count or 1)..")")
   resolved[#resolved+1] = {index=ie.index, id=id, damage=dmg, count=ie.count or 1}
 end
 flushDebug("ingredients-resolved")
@@ -461,6 +462,7 @@ end
 
 dbg("Staging + writing output...")
 local outId, outDmg = splitItemId(itemName)
+dbg("  -> writing output "..outId..":"..outDmg)
 local ok4, err4 = pcall(db.set, dbSlot, outId, outDmg)
 if not ok4 then
   dbg("[FAIL] database.set (output) failed (slot "..dbSlot.."): "..tostring(err4)); flushDebug("write-fail"); return
@@ -474,20 +476,63 @@ end
 dbg("[OK] Pattern encoded in OC Pattern Editor slot "..EDITOR_SLOT..".")
 print()
 
--- ── sanity check: read the resulting pattern item back ──
--- Uses getInterfacePattern, NOT getInterfaceConfiguration -- the latter
--- calls validPattern() internally, which (for a plain non-fluid pattern)
--- is defined as "true only if it has NO output yet". Since we just wrote
--- a real output, getInterfaceConfiguration would now legitimately throw
--- "Not Fluid Encoded pattern!" on a perfectly successful write -- it's
--- meant for reading a pattern WHILE still blank/editable, not after.
--- getInterfacePattern has no such gate; it just returns whatever's in
--- the slot, so it's the correct choice for a post-write sanity check.
+-- ── sanity check #1: read the resulting pattern item back ──
+-- Uses getInterfacePattern, NOT getInterfaceConfiguration -- see the
+-- functional-validity check below for why. getInterfacePattern just
+-- returns whatever raw stack is in the slot, no validation gate, so
+-- it always succeeds if an item is physically there.
 local okFinal, finalStack = pcall(editor.getInterfacePattern, EDITOR_SLOT)
 if okFinal and finalStack then
   dbg("[OK] Resulting item in editor slot: "..tostring(finalStack.label or finalStack.name or "?"))
 else
   dbg("[WARN] Couldn't read back the encoded pattern: "..tostring(finalStack))
+end
+
+-- ── sanity check #2: is this actually a REAL, AE2-recognized recipe? ──
+-- Everything above only confirms the raw NBT write didn't throw -- it
+-- does NOT confirm AE2 itself considers the result a valid recipe.
+-- getInterfaceConfiguration() calls the driver's validPattern(), which
+-- calls AE2's own ItemEncodedPattern.getOutput(pattern) -- the SAME
+-- check the tooltip and actual crafting use. Confirmed from the real
+-- driver source (DriverOCPatternEditor.java, fetched 2026-07-13):
+--   private boolean validPattern(ItemStack pattern) {
+--     ...
+--     return iep.getOutput(pattern) == null;
+--   }
+-- Two distinct outcomes after a completed write:
+--   - throws "Not Fluid Encoded pattern!" -> getOutput() returned a
+--     REAL non-null output, i.e. validPattern()==false because the
+--     pattern is no longer "blank". This is actually the GOOD outcome!
+--     It just means AE2 accepted the recipe, so this editor block
+--     won't let itself edit it further (by design). If the item still
+--     LOOKS unchanged/wrong in-game after this, that's a client-side
+--     tooltip/render staleness issue, not a data problem -- try
+--     closing/reopening the block's GUI or re-picking-up the item.
+--   - throws anything else (e.g. "No pattern here!") -> getOutput()
+--     itself threw inside AE2's PatternHelper, meaning the ingredients
+--     we just wrote do NOT form a recipe AE2 recognizes. Given the
+--     ordering (this fires ONLY on the post-write check, not during
+--     the writes themselves -- see setPatternSlot's validPattern()
+--     call, which only checks the PRE-write state), this is either an
+--     exact item/damage mismatch (compare the "-> writing X:Y" lines
+--     above against the real recipe) or a permanently poisoned pattern
+--     from an earlier invalid encode on this same physical item.
+dbg("Verifying AE2 actually accepts this as a real recipe...")
+local okCfg, cfgErr = pcall(editor.getInterfaceConfiguration, EDITOR_SLOT)
+if okCfg then
+  dbg("[WARN] getInterfaceConfiguration did not throw -- unexpected.")
+  dbg("       Means AE2's getOutput() returned nil, i.e. it thinks this")
+  dbg("       pattern STILL has no output, even right after we wrote one.")
+elseif tostring(cfgErr):find("Not Fluid Encoded pattern", 1, true) then
+  dbg("[OK] Confirmed: AE2 accepts this as a real, matching recipe.")
+else
+  dbg("[FAIL] AE2 rejected the written pattern: "..tostring(cfgErr))
+  dbg("       The raw NBT write above succeeded, but this is NOT a")
+  dbg("       recipe AE2 recognizes. Check the resolved id:damage lines")
+  dbg("       above against the real recipe exactly (wrong meta/variant")
+  dbg("       is the most likely cause), or this physical pattern item")
+  dbg("       may already be permanently poisoned from an earlier bad")
+  dbg("       encode -- if so, grab a fresh blank pattern and re-prime it.")
 end
 
 dbg("")
