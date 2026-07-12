@@ -97,14 +97,6 @@ local function recoverPreviousLog()
 end
 recoverPreviousLog()
 
-local function safeCall(fn, ...)
-  local callOk, a, b = pcall(fn, ...)
-  if not callOk then
-    return false, a
-  end
-  return a, b
-end
-
 dbg("=== OC Pattern Editor Diagnostic ===")
 
 if not component.isAvailable("oc_pattern_editor") then
@@ -138,11 +130,23 @@ dbg("Bound to address: "..tostring(editor.address))
 print()
 
 -- ── scan all 16 slots ──
+-- Uses plain pcall(), NOT a wrapper that reshuffles return values -- a
+-- prior version here used a safeCall() helper that treated the wrapped
+-- function's OWN first return value as a success flag. That's wrong for
+-- getInterfacePattern(): it legitimately returns nil (no throw, valid
+-- call) when a slot is empty, and a real stack table when one isn't.
+-- Shoving that single nullable return through an (ok, data) reshuffle
+-- meant: empty slots (fn returns nil) looked like a THROWN error ("ok"
+-- ended up nil/falsy), while slots WITH an item (fn returns a table)
+-- looked like an empty slot ("ok" absorbed the table, "data" was left
+-- nil). Plain pcall(fn, ...) doesn't have this problem -- its own
+-- success flag is completely independent of whatever fn itself returns,
+-- including a legitimate nil.
 dbg("Scanning all 16 internal slots...")
 local anyFound = false
 for i = 1, 16 do
-  local ok, stack = safeCall(editor.getInterfacePattern, i)
-  if not ok then
+  local pOk, stack = pcall(editor.getInterfacePattern, i)
+  if not pOk then
     dbg(string.format("  slot %2d: [ERROR] %s", i, tostring(stack)))
   elseif not stack then
     dbg(string.format("  slot %2d: (empty)", i))

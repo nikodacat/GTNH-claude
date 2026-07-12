@@ -93,7 +93,7 @@ local net = component.internet
 -- flushDebug() only sends what's buffered in memory, and only when we
 -- reach a checkpoint that calls it -- a genuinely unexpected crash
 -- (an uncaught native error firing somewhere we didn't wrap in
--- safeCall) skips straight past that and OC's own crash handler prints
+-- pcall) skips straight past that and OC's own crash handler prints
 -- a traceback to the LOCAL terminal only, never the web viewer. Writing
 -- every dbg() line straight to disk as it happens means the log
 -- survives even that kind of hard crash, and gets auto-recovered and
@@ -273,21 +273,25 @@ local function resolveEntry(entry)
   end
 end
 
--- ── safe wrapper: some component methods (e.g. database.set with an
--- out-of-range slot, or the pattern editor's own callbacks when the
--- editor slot is empty/invalid) throw a hard Lua error instead of
--- returning (false, err). An uncaught throw here skips right past our
--- own dbg()/flushDebug() error handling and crashes the whole script --
--- OC's own crash handler prints a traceback to the LOCAL terminal only,
--- so it never reaches the web viewer. Routing every risky call through
--- this wrapper means ANY failure, thrown or returned, gets reported.
-local function safeCall(fn, ...)
-  local callOk, a, b = pcall(fn, ...)
-  if not callOk then
-    return false, a  -- a holds the pcall error message
-  end
-  return a, b
-end
+-- ── on wrapping risky calls: some component methods (e.g. database.set
+-- with an out-of-range slot) throw a hard Lua error instead of
+-- returning (false, err). An uncaught throw skips right past our own
+-- dbg()/flushDebug() error handling and crashes the whole script -- OC's
+-- own crash handler prints a traceback to the LOCAL terminal only, so it
+-- never reaches the web viewer. Every risky call below is wrapped in
+-- plain pcall(fn, ...) so any thrown failure gets caught and reported.
+--
+-- IMPORTANT: use pcall(fn, ...) directly, NOT a custom wrapper that
+-- reshuffles return values (an earlier version of this file had a
+-- safeCall() helper that did `return a, b` from `local callOk, a, b =
+-- pcall(...)` on success). That's broken for any callback whose own
+-- legitimate return value can be nil -- e.g. getInterfacePattern()
+-- correctly returns nil (no throw) when a slot is empty. Reshuffling
+-- made that indistinguishable from a thrown error, and separately made
+-- a *present* item register as "empty" (the real stack ended up in the
+-- discarded first slot). pcall's own success flag is always a genuine
+-- boolean independent of what the wrapped function returns, so calling
+-- it directly avoids the whole class of bug.
 
 -- ── the OC Pattern Editor's own 16-slot inventory slot where you
 -- physically placed a blank AE2 pattern item before running this
@@ -303,11 +307,11 @@ local EDITOR_SLOT = 1
 -- to be >= 0, i.e. the caller must pass 1-based numbers.
 local function clearPattern(maxIn, maxOut)
   for i=1,maxIn  do
-    local ok, err = safeCall(editor.clearInterfacePatternInput, EDITOR_SLOT, i)
+    local ok, err = pcall(editor.clearInterfacePatternInput, EDITOR_SLOT, i)
     if not ok then dbg("  [NOTE] clearInterfacePatternInput("..i..") failed: "..tostring(err)) end
   end
   for o=1,maxOut do
-    local ok, err = safeCall(editor.clearInterfacePatternOutput, EDITOR_SLOT, o)
+    local ok, err = pcall(editor.clearInterfacePatternOutput, EDITOR_SLOT, o)
     if not ok then dbg("  [NOTE] clearInterfacePatternOutput("..o..") failed: "..tostring(err)) end
   end
 end
@@ -316,7 +320,7 @@ end
 print("=== Pattern Writer Test (via OC Pattern Editor) ===")
 
 dbg("Checking OC Pattern Editor slot "..EDITOR_SLOT.." for a blank pattern...")
-local okChk, existing = safeCall(editor.getInterfacePattern, EDITOR_SLOT)
+local okChk, existing = pcall(editor.getInterfacePattern, EDITOR_SLOT)
 if not okChk then
   dbg("[FAIL] getInterfacePattern failed: "..tostring(existing)); flushDebug("editor-check-fail"); return
 end
@@ -399,11 +403,11 @@ dbg("Staging + writing "..#resolved.." input(s)...")
 -- NOT 0-indexed. Starting at 0 throws "invalid slot" immediately.
 local dbSlot = 1
 for _, r in ipairs(resolved) do
-  local ok, err2 = safeCall(db.set, dbSlot, r.id, r.damage)
+  local ok, err2 = pcall(db.set, dbSlot, r.id, r.damage)
   if not ok then
     dbg("[FAIL] database.set failed (slot "..dbSlot.."): "..tostring(err2)); flushDebug("write-fail"); return
   end
-  local ok2, err3 = safeCall(editor.setInterfacePatternItemInput,
+  local ok2, err3 = pcall(editor.setInterfacePatternItemInput,
     EDITOR_SLOT, db.address, dbSlot, r.count, r.index)
   if not ok2 then
     dbg("[FAIL] setInterfacePatternItemInput failed (db slot "..dbSlot..", index "..r.index.."): "..tostring(err3)); flushDebug("write-fail"); return
@@ -413,11 +417,11 @@ end
 
 dbg("Staging + writing output...")
 local outId, outDmg = splitItemId(itemName)
-local ok4, err4 = safeCall(db.set, dbSlot, outId, outDmg)
+local ok4, err4 = pcall(db.set, dbSlot, outId, outDmg)
 if not ok4 then
   dbg("[FAIL] database.set (output) failed (slot "..dbSlot.."): "..tostring(err4)); flushDebug("write-fail"); return
 end
-local ok5, err5 = safeCall(editor.setInterfacePatternItemOutput,
+local ok5, err5 = pcall(editor.setInterfacePatternItemOutput,
   EDITOR_SLOT, db.address, dbSlot, 1, 1)
 if not ok5 then
   dbg("[FAIL] setInterfacePatternItemOutput failed (slot "..dbSlot.."): "..tostring(err5)); flushDebug("write-fail"); return
@@ -427,7 +431,7 @@ dbg("[OK] Pattern encoded in OC Pattern Editor slot "..EDITOR_SLOT..".")
 print()
 
 -- ── sanity check: read the resulting pattern item back ──
-local okFinal, finalStack = safeCall(editor.getInterfaceConfiguration, EDITOR_SLOT)
+local okFinal, finalStack = pcall(editor.getInterfaceConfiguration, EDITOR_SLOT)
 if okFinal and finalStack then
   dbg("[OK] Resulting item in editor slot: "..tostring(finalStack.label or finalStack.name or "?"))
 else
