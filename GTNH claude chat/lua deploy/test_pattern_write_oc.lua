@@ -241,4 +241,27 @@ local outId, outDmg = splitItemId(itemName)
 local ok4 = db.set(dbSlot, outId, outDmg)
 if not ok4 then print("[FAIL] database.set (output) failed"); return end
 local ok5, err5 = iface.setInterfacePatternOutput(PATTERN_INDEX, db.address, dbSlot, 1, 0)
-if not ok5 then print("[FAIL] setInterfacePat
+if not ok5 then print("[FAIL] setInterfacePatternOutput failed: "..tostring(err5)); return end
+
+print("[OK] Pattern written.")
+print()
+
+-- ── verify it shows up as craftable ──
+print("Checking me.getCraftables() for confirmation (may take a moment)...")
+os.sleep(1)
+local ok6, craftables = pcall(me.getCraftables)
+local found = false
+if ok6 and craftables then
+  for _,c in ipairs(craftables) do
+    if c.name==outId then found=true; break end
+  end
+end
+if found then
+  print("[SUCCESS] "..outId.." now appears in getCraftables().")
+else
+  print("[WARN] "..outId.." not yet showing as craftable.")
+  print("       Check in-game: does the buffer ME Interface show the")
+  print("       new pattern in its GUI? Is it connected to the network")
+  print("       with enough channels, and is a Molecular Assembler or")
+  print("       Crafting CPU available for the network to use it?")
+end

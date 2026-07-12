@@ -182,4 +182,35 @@ while true do
   if not input then break end
   input = input:match("^%s*(.-)%s*$")
   if input=="" then goto continue end
-  if input:lower()=="quit" then fg(0xFFFF00); print("Bye!");
+  if input:lower()=="quit" then fg(0xFFFF00); print("Bye!"); break end
+
+  history[#history+1] = {role="user", content=input}
+
+  fg(0x888888); io.write("[~] Thinking...\n"); fg(0xFFFFFF)
+
+  local raw, err = post("/chat", {messages=history, source="oc"})
+  if not raw then
+    fg(0xFF4444); print("[ERR] "..(err or "?")); fg(0xFFFFFF)
+    history[#history]=nil
+    goto continue
+  end
+
+  local reply, rerr = getReply(raw)
+  if not reply then
+    fg(0xFF4444); print("[ERR] "..(rerr or raw)); fg(0xFFFFFF)
+    history[#history]=nil
+    goto continue
+  end
+
+  -- check if server flagged CJK content
+  local hasCJK = raw:find('"has_cjk":%s*true') ~= nil
+  if hasCJK then
+    fg(0xFFAA00); print("[!] Full reply on web viewer (contains non-ASCII).")
+    fg(0xFFFFFF)
+  end
+
+  history[#history+1] = {role="assistant", content=reply}
+  printWrapped(0x00FFFF, "Claude: ", reply)
+
+  ::continue::
+end

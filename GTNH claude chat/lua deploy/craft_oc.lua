@@ -571,4 +571,27 @@ while true do
     history[#history+1]={role="assistant",content=message}
 
     if hasCJK then
-      cprint(0xFFA
+      cprint(0xFFAA00,"[!] Full reply on web viewer (contains non-ASCII).")
+    end
+
+    print()
+    printWrapped(0x00FFFF,"Claude: ",message)
+    if warn and warn~="null" and warn~="" then
+      cprint(0xFFAA00,"[!] "..warn)
+    end
+
+    if action=="craft" and item and item~="null" then
+      cprint(0xFFFF00,string.format("\n[Autocraft] %s x%d",item,amount))
+      local ok,aerr=triggerAutocraft(item,amount)
+      if ok then cprint(0x00FF00,"  [+] Done!")
+      else cprint(0xFF4444,"  [!] "..(aerr or "failed")) end
+    elseif action=="explain" then
+      cprint(0xFFAA00,"\n[No pattern] Cannot autocraft — see recipe above.")
+      cprint(0x888888,"  -> Encode a pattern in ME Pattern Terminal to enable.")
+    end
+
+    flushDebug("request-"..input:sub(1,20))
+  end
+
+  ::continue::
+end
