@@ -1,15 +1,46 @@
 -- =============================================
 --  test_pattern_write_oc.lua
 --  Tests writing an AE2 crafting pattern on the
---  fly, using recipe_db.json data, into a "buffer"
---  ME Interface -- no Pattern Terminal GUI needed.
+--  fly, using recipe_db.json data, via the OC
+--  Pattern Editor block (from AE2 Fluid Crafting).
 --
---  Requires (all connected via separate OC Adapters):
---    - me_controller  : your existing full-network link
---    - me_interface   : a spare ME Interface dedicated
---                        as a pattern "buffer" (not wired
---                        to any machine)
---    - database        : a Database Upgrade (any tier)
+--  WHY NOT me_interface DIRECTLY:
+--  me_interface.setInterfacePatternInput/Output()
+--  writes NBT straight into a live network pattern
+--  slot with no backing physical item -- this is the
+--  same class of bug GTNH issue #20730 covers, and is
+--  exactly why AE2FluidCraft-Rework's changelog
+--  (v1.3.5-gtnh-pre) REMOVED the equivalent method from
+--  the OC Pattern Editor block: it let items be
+--  fabricated ("spawned") out of thin air. The sanctioned
+--  replacement is this dedicated block, which only lets
+--  you encode NBT onto a REAL, physical AE2 pattern item
+--  sitting in ITS OWN 16-slot inventory. Nothing touches
+--  the live network until you physically move that real,
+--  now-encoded pattern item into an actual ME Interface --
+--  same as encoding one by hand at a Pattern Terminal.
+--
+--  Requires (all connected via separate OC Adapters,
+--  or directly adjacent to the computer):
+--    - me_controller    : your existing full-network link
+--                          (only used to resolve ore: tags
+--                          and to sanity-check the result)
+--    - oc_pattern_editor : the "OC Pattern Editor" block
+--                          from AE2 Fluid Crafting. NOT the
+--                          same block as a me_interface --
+--                          it's a standalone item-only block
+--                          with no network connection of its
+--                          own. BEFORE running this script,
+--                          put one blank AE2 pattern item
+--                          into its first inventory slot.
+--    - database          : a Database Upgrade (any tier)
+--
+--  AFTER this script reports [OK], take the now-encoded
+--  pattern item out of the OC Pattern Editor and place it
+--  into a real ME Interface's pattern slots yourself -- that
+--  final physical move is what actually activates the recipe
+--  on your network. This script does not do that move for
+--  you (out of scope for this POC test script).
 --
 --  IMPORTANT CAVEAT discovered from recipe_db.json:
 --  many "grid"/"ingredients" entries are OreDictionary
@@ -133,10 +164,12 @@ recoverPreviousLog()
 if not component.isAvailable("me_controller") then
   dbg("[FAIL] no me_controller"); flushDebug("hw-fail"); return
 end
-if not component.isAvailable("me_interface") then
-  dbg("[FAIL] no me_interface component found.")
-  dbg("       Connect an OC Adapter to a spare ME Interface block")
-  dbg("       (not wired to any machine -- this one is a pattern buffer).")
+if not component.isAvailable("oc_pattern_editor") then
+  dbg("[FAIL] no oc_pattern_editor component found.")
+  dbg("       Connect an OC Adapter to (or place directly adjacent")
+  dbg("       to this computer) an OC Pattern Editor block -- from")
+  dbg("       AE2 Fluid Crafting. This is NOT a me_interface; it's a")
+  dbg("       standalone 16-slot block with no network link of its own.")
   flushDebug("hw-fail")
   return
 end
@@ -147,9 +180,9 @@ if not component.isAvailable("database") then
   return
 end
 
-local me  = component.me_controller
-local iface = component.me_interface
-local db  = component.database
+local me     = component.me_controller
+local editor = component.oc_pattern_editor
+local db     = component.database
 flushDebug("hw-ok")
 
 -- ── minimal HTTP GET ──────────────────────────
@@ -241,9 +274,10 @@ local function resolveEntry(entry)
 end
 
 -- ── safe wrapper: some component methods (e.g. database.set with an
--- out-of-range slot) throw a hard Lua error instead of returning
--- (false, err). An uncaught throw here skips right past our own
--- dbg()/flushDebug() error handling and crashes the whole script --
+-- out-of-range slot, or the pattern editor's own callbacks when the
+-- editor slot is empty/invalid) throw a hard Lua error instead of
+-- returning (false, err). An uncaught throw here skips right past our
+-- own dbg()/flushDebug() error handling and crashes the whole script --
 -- OC's own crash handler prints a traceback to the LOCAL terminal only,
 -- so it never reaches the web viewer. Routing every risky call through
 -- this wrapper means ANY failure, thrown or returned, gets reported.
@@ -255,20 +289,46 @@ local function safeCall(fn, ...)
   return a, b
 end
 
--- ── clear all input/output slots of a pattern before rewriting ──
-local function clearPattern(patternIndex, maxIn, maxOut)
-  for i=0,maxIn-1  do
-    local ok, err = safeCall(iface.clearInterfacePatternInput, patternIndex, i)
+-- ── the OC Pattern Editor's own 16-slot inventory slot where you
+-- physically placed a blank AE2 pattern item before running this
+-- script. Slots are 1-indexed (matches database.set() and most other
+-- OC inventory-style APIs).
+local EDITOR_SLOT = 1
+
+-- ── clear all input/output indices of the pattern in EDITOR_SLOT
+-- before rewriting. Indices are also 1-indexed here (1..512), unlike
+-- the old me_interface grid slots which were 0-indexed -- confirmed
+-- from DriverOCPatternEditor.java's checkSlot()/setPatternSlot(),
+-- which both do "args.checkInteger(n) - 1" and require the result
+-- to be >= 0, i.e. the caller must pass 1-based numbers.
+local function clearPattern(maxIn, maxOut)
+  for i=1,maxIn  do
+    local ok, err = safeCall(editor.clearInterfacePatternInput, EDITOR_SLOT, i)
     if not ok then dbg("  [NOTE] clearInterfacePatternInput("..i..") failed: "..tostring(err)) end
   end
-  for o=0,maxOut-1 do
-    local ok, err = safeCall(iface.clearInterfacePatternOutput, patternIndex, o)
+  for o=1,maxOut do
+    local ok, err = safeCall(editor.clearInterfacePatternOutput, EDITOR_SLOT, o)
     if not ok then dbg("  [NOTE] clearInterfacePatternOutput("..o..") failed: "..tostring(err)) end
   end
 end
 
 -- ── main ──────────────────────────────────────
-print("=== Pattern Writer Test ===")
+print("=== Pattern Writer Test (via OC Pattern Editor) ===")
+
+dbg("Checking OC Pattern Editor slot "..EDITOR_SLOT.." for a blank pattern...")
+local okChk, existing = safeCall(editor.getInterfacePattern, EDITOR_SLOT)
+if not okChk then
+  dbg("[FAIL] getInterfacePattern failed: "..tostring(existing)); flushDebug("editor-check-fail"); return
+end
+if not existing then
+  dbg("[FAIL] No item in OC Pattern Editor slot "..EDITOR_SLOT..".")
+  dbg("       Put one blank AE2 pattern item into its first inventory")
+  dbg("       slot in-game, then re-run this script.")
+  flushDebug("no-blank-pattern")
+  return
+end
+dbg("[OK] Found an item in slot "..EDITOR_SLOT..": "..tostring(existing.label or existing.name or "?"))
+
 io.write("Exact output item to craft (e.g. minecraft:stick or gregtech:gt.metaitem.01:810): ")
 local itemName = io.read()
 if not itemName or itemName=="" then print("cancelled"); return end
@@ -292,7 +352,7 @@ if rtype=="crafting_shaped" then
   local grid = extractArr(raw,"grid")
   if not grid then dbg("[FAIL] couldn't parse grid"); flushDebug("parse-fail"); return end
   for i,v in ipairs(grid) do
-    if v then ingredientEntries[#ingredientEntries+1] = {slot=i-1, entry=v} end
+    if v then ingredientEntries[#ingredientEntries+1] = {index=i, entry=v} end
   end
 elseif rtype=="crafting_shapeless" then
   local ing = extractArr(raw,"ingredients")
@@ -306,7 +366,7 @@ elseif rtype=="crafting_shapeless" then
     end
   end
   for i,v in ipairs(order) do
-    ingredientEntries[#ingredientEntries+1] = {slot=i-1, entry=v, count=counts[v]}
+    ingredientEntries[#ingredientEntries+1] = {index=i, entry=v, count=counts[v]}
   end
 else
   dbg("[FAIL] unsupported recipe type: "..tostring(rtype).." (only crafting_shaped/shapeless handled)")
@@ -317,22 +377,21 @@ end
 dbg(#ingredientEntries.." ingredient slot(s) to resolve:")
 local resolved = {}
 for _,ie in ipairs(ingredientEntries) do
-  dbg("  slot "..ie.slot..": "..ie.entry)
+  dbg("  index "..ie.index..": "..ie.entry)
   local id,dmg = resolveEntry(ie.entry)
   if not id then
     dbg("  [FAIL] could not resolve ingredient: "..ie.entry)
     flushDebug("resolve-fail")
     return
   end
-  resolved[#resolved+1] = {slot=ie.slot, id=id, damage=dmg, count=ie.count or 1}
+  resolved[#resolved+1] = {index=ie.index, id=id, damage=dmg, count=ie.count or 1}
 end
 flushDebug("ingredients-resolved")
 
--- ── write into pattern slot 0 of the buffer interface ──
-local PATTERN_INDEX = 0
+-- ── clear + rewrite the pattern in the OC Pattern Editor's slot ──
 print()
-dbg("Clearing pattern slot "..PATTERN_INDEX.." on buffer interface...")
-clearPattern(PATTERN_INDEX, 9, 4)
+dbg("Clearing pattern in editor slot "..EDITOR_SLOT.."...")
+clearPattern(9, 4)
 
 dbg("Staging + writing "..#resolved.." input(s)...")
 -- NOTE: database upgrade slots are 1-indexed in OC (like most OC
@@ -344,9 +403,10 @@ for _, r in ipairs(resolved) do
   if not ok then
     dbg("[FAIL] database.set failed (slot "..dbSlot.."): "..tostring(err2)); flushDebug("write-fail"); return
   end
-  local ok2, err3 = safeCall(iface.setInterfacePatternInput, PATTERN_INDEX, db.address, dbSlot, r.count, r.slot)
+  local ok2, err3 = safeCall(editor.setInterfacePatternItemInput,
+    EDITOR_SLOT, db.address, dbSlot, r.count, r.index)
   if not ok2 then
-    dbg("[FAIL] setInterfacePatternInput failed (slot "..dbSlot..", grid "..r.slot.."): "..tostring(err3)); flushDebug("write-fail"); return
+    dbg("[FAIL] setInterfacePatternItemInput failed (db slot "..dbSlot..", index "..r.index.."): "..tostring(err3)); flushDebug("write-fail"); return
   end
   dbSlot = dbSlot + 1
 end
@@ -357,31 +417,28 @@ local ok4, err4 = safeCall(db.set, dbSlot, outId, outDmg)
 if not ok4 then
   dbg("[FAIL] database.set (output) failed (slot "..dbSlot.."): "..tostring(err4)); flushDebug("write-fail"); return
 end
-local ok5, err5 = safeCall(iface.setInterfacePatternOutput, PATTERN_INDEX, db.address, dbSlot, 1, 0)
+local ok5, err5 = safeCall(editor.setInterfacePatternItemOutput,
+  EDITOR_SLOT, db.address, dbSlot, 1, 1)
 if not ok5 then
-  dbg("[FAIL] setInterfacePatternOutput failed (slot "..dbSlot.."): "..tostring(err5)); flushDebug("write-fail"); return
+  dbg("[FAIL] setInterfacePatternItemOutput failed (slot "..dbSlot.."): "..tostring(err5)); flushDebug("write-fail"); return
 end
 
-dbg("[OK] Pattern written.")
+dbg("[OK] Pattern encoded in OC Pattern Editor slot "..EDITOR_SLOT..".")
 print()
 
--- ── verify it shows up as craftable ──
-dbg("Checking me.getCraftables() for confirmation (may take a moment)...")
-os.sleep(1)
-local ok6, craftables = pcall(me.getCraftables)
-local found = false
-if ok6 and craftables then
-  for _,c in ipairs(craftables) do
-    if c.name==outId then found=true; break end
-  end
-end
-if found then
-  dbg("[SUCCESS] "..outId.." now appears in getCraftables().")
+-- ── sanity check: read the resulting pattern item back ──
+local okFinal, finalStack = safeCall(editor.getInterfaceConfiguration, EDITOR_SLOT)
+if okFinal and finalStack then
+  dbg("[OK] Resulting item in editor slot: "..tostring(finalStack.label or finalStack.name or "?"))
 else
-  dbg("[WARN] "..outId.." not yet showing as craftable.")
-  dbg("       Check in-game: does the buffer ME Interface show the")
-  dbg("       new pattern in its GUI? Is it connected to the network")
-  dbg("       with enough channels, and is a Molecular Assembler or")
-  dbg("       Crafting CPU available for the network to use it?")
+  dbg("[WARN] Couldn't read back the encoded pattern: "..tostring(finalStack))
 end
-flushDebug("pattern-write-"..(found and "success" or "unconfirmed"))
+
+dbg("")
+dbg("=== NEXT STEP (manual, in-game) ===")
+dbg("This pattern is encoded but NOT yet live -- it only exists as a")
+dbg("physical item sitting in the OC Pattern Editor's inventory. Take")
+dbg("it out and place it into a real ME Interface's pattern slots to")
+dbg("activate it on your network. After that, "..outId.." should show")
+dbg("up in me.getCraftables() / the ME Interface's craftable list.")
+flushDebug("pattern-encoded")
