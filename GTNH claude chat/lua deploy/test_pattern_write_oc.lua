@@ -305,15 +305,24 @@ local EDITOR_SLOT = 1
 -- from DriverOCPatternEditor.java's checkSlot()/setPatternSlot(),
 -- which both do "args.checkInteger(n) - 1" and require the result
 -- to be >= 0, i.e. the caller must pass 1-based numbers.
+-- Returns true if the pattern needs to be "primed" first (see below).
 local function clearPattern(maxIn, maxOut)
+  local needsPriming = false
   for i=1,maxIn  do
     local ok, err = pcall(editor.clearInterfacePatternInput, EDITOR_SLOT, i)
-    if not ok then dbg("  [NOTE] clearInterfacePatternInput("..i..") failed: "..tostring(err)) end
+    if not ok then
+      dbg("  [NOTE] clearInterfacePatternInput("..i..") failed: "..tostring(err))
+      if tostring(err):find("No pattern here", 1, true) then needsPriming = true end
+    end
   end
   for o=1,maxOut do
     local ok, err = pcall(editor.clearInterfacePatternOutput, EDITOR_SLOT, o)
-    if not ok then dbg("  [NOTE] clearInterfacePatternOutput("..o..") failed: "..tostring(err)) end
+    if not ok then
+      dbg("  [NOTE] clearInterfacePatternOutput("..o..") failed: "..tostring(err))
+      if tostring(err):find("No pattern here", 1, true) then needsPriming = true end
+    end
   end
+  return needsPriming
 end
 
 -- ── main ──────────────────────────────────────
@@ -395,7 +404,25 @@ flushDebug("ingredients-resolved")
 -- ── clear + rewrite the pattern in the OC Pattern Editor's slot ──
 print()
 dbg("Clearing pattern in editor slot "..EDITOR_SLOT.."...")
-clearPattern(9, 4)
+local needsPriming = clearPattern(9, 4)
+if needsPriming then
+  dbg("")
+  dbg("[FAIL] This pattern item has never been encoded before -- it has")
+  dbg("       no recipe data yet at all, so the OC Pattern Editor can only")
+  dbg("       EDIT an existing pattern's entries, not create one from")
+  dbg("       nothing (confirmed: its container has no NBT-init logic).")
+  dbg("")
+  dbg("       Fix: take this pattern to a real ME Pattern Terminal and")
+  dbg("       encode ANY placeholder recipe onto it there first -- it")
+  dbg("       doesn't matter what, this script overwrites it anyway.")
+  dbg("       Then bring it back to OC Pattern Editor slot "..EDITOR_SLOT..
+      " and re-run this script.")
+  dbg("")
+  dbg("       This is a ONE-TIME cost per physical pattern item -- once")
+  dbg("       primed, it can be rewritten by this script indefinitely.")
+  flushDebug("needs-priming")
+  return
+end
 
 dbg("Staging + writing "..#resolved.." input(s)...")
 -- NOTE: database upgrade slots are 1-indexed in OC (like most OC
