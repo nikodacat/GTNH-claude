@@ -31,8 +31,15 @@
 --                          it's a standalone item-only block
 --                          with no network connection of its
 --                          own. BEFORE running this script,
---                          put one blank AE2 pattern item
---                          into its first inventory slot.
+--                          put an AE2 pattern item into its
+--                          first inventory slot that has ALREADY
+--                          been encoded with a genuinely valid,
+--                          real recipe at a real ME Pattern
+--                          Terminal (e.g. 2 planks -> 4 sticks --
+--                          content doesn't matter, this script
+--                          overwrites it, but it must be a REAL
+--                          recipe, not arbitrary items -- see the
+--                          needsPriming block below for why).
 --    - database          : a Database Upgrade (any tier)
 --
 --  AFTER this script reports [OK], take the now-encoded
@@ -413,13 +420,23 @@ if needsPriming then
   dbg("       nothing (confirmed: its container has no NBT-init logic).")
   dbg("")
   dbg("       Fix: take this pattern to a real ME Pattern Terminal and")
-  dbg("       encode ANY placeholder recipe onto it there first -- it")
-  dbg("       doesn't matter what, this script overwrites it anyway.")
-  dbg("       Then bring it back to OC Pattern Editor slot "..EDITOR_SLOT..
-      " and re-run this script.")
+  dbg("       encode a GENUINELY VALID, real recipe onto it there first --")
+  dbg("       e.g. 2 wood planks -> 4 sticks. It must be an actual")
+  dbg("       registered recipe, NOT arbitrary items -- AE2's PatternHelper")
+  dbg("       sets a permanent 'InvalidPattern' NBT flag the first time a")
+  dbg("       pattern fails to parse as a real recipe, and every future")
+  dbg("       check (tooltip, getOutput(), crafting) short-circuits on")
+  dbg("       that flag BEFORE even looking at current in/out data -- so")
+  dbg("       an invalid placeholder poisons the item permanently, and")
+  dbg("       our later writes here would succeed at the raw-NBT level")
+  dbg("       but stay invisible everywhere else. If this pattern has")
+  dbg("       already been through an invalid placeholder, grab a FRESH")
+  dbg("       one instead of reusing it.")
+  dbg("       Then bring the (validly-primed) pattern back to OC Pattern")
+  dbg("       Editor slot "..EDITOR_SLOT.." and re-run this script.")
   dbg("")
   dbg("       This is a ONE-TIME cost per physical pattern item -- once")
-  dbg("       primed, it can be rewritten by this script indefinitely.")
+  dbg("       validly primed, it can be rewritten by this script indefinitely.")
   flushDebug("needs-priming")
   return
 end
@@ -458,7 +475,15 @@ dbg("[OK] Pattern encoded in OC Pattern Editor slot "..EDITOR_SLOT..".")
 print()
 
 -- ── sanity check: read the resulting pattern item back ──
-local okFinal, finalStack = pcall(editor.getInterfaceConfiguration, EDITOR_SLOT)
+-- Uses getInterfacePattern, NOT getInterfaceConfiguration -- the latter
+-- calls validPattern() internally, which (for a plain non-fluid pattern)
+-- is defined as "true only if it has NO output yet". Since we just wrote
+-- a real output, getInterfaceConfiguration would now legitimately throw
+-- "Not Fluid Encoded pattern!" on a perfectly successful write -- it's
+-- meant for reading a pattern WHILE still blank/editable, not after.
+-- getInterfacePattern has no such gate; it just returns whatever's in
+-- the slot, so it's the correct choice for a post-write sanity check.
+local okFinal, finalStack = pcall(editor.getInterfacePattern, EDITOR_SLOT)
 if okFinal and finalStack then
   dbg("[OK] Resulting item in editor slot: "..tostring(finalStack.label or finalStack.name or "?"))
 else
