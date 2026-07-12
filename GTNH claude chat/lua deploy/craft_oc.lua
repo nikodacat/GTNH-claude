@@ -37,13 +37,26 @@ end
 local SERVER = loadConfig().SERVER
 local SCRIPT_NAME = "craft_oc"
 
--- ── debug logger ──────────────────────────────
+-- ── crash-resistant local log file ─────────────
+-- flushDebug() only sends what's buffered in memory, and only at a
+-- checkpoint that calls it -- a genuinely unexpected crash (an
+-- uncaught native error somewhere) skips straight past that and OC's
+-- own crash handler prints a traceback to the LOCAL terminal only,
+-- never the web viewer. Writing every dbg() line straight to disk as
+-- it happens means the log survives even that kind of hard crash, and
+-- gets auto-recovered and pushed to the web the *next* time this
+-- script starts.
+local LOG_FILE = DISK.."/oc_log_"..SCRIPT_NAME..".txt"
+
+-- ── debug logger (mirrors all output to the web viewer + local disk) ─
 local debugLines = {}
 
 local function dbg(text)
   local t = string.format("[%.1fs] %s", computer.uptime(), text)
   print(t)
   debugLines[#debugLines+1] = t
+  local lf = io.open(LOG_FILE, "a")
+  if lf then lf:write(t.."\n"); lf:close() end
 end
 
 local function flushDebug(label)
@@ -70,6 +83,36 @@ local function flushDebug(label)
     req.close()
   end)
 end
+
+-- ── recover + push any log left over from a crashed previous run ──
+local function recoverPreviousLog()
+  local f = io.open(LOG_FILE, "r")
+  if not f then return end
+  local prev = f:read("*a")
+  f:close()
+  local wf = io.open(LOG_FILE, "w")
+  if wf then wf:close() end
+  if not prev or prev == "" then return end
+  if not component.isAvailable("internet") then return end
+  local net = component.internet
+  local full = "["..SCRIPT_NAME.."] recovered-from-previous-crash:\n"..prev
+  local body = '{"role":"diag","text":"'
+               ..full:gsub('\\','\\\\'):gsub('"','\\"'):gsub('\n','\\n')
+               ..'"}'
+  pcall(function()
+    local req = net.request(SERVER.."/log", body, {["Content-Type"]="application/json"})
+    if not req then return end
+    local dl = computer.uptime()+5
+    while computer.uptime()<dl do
+      local ok = req.finishConnect()
+      if ok then break end
+      if ok==nil then req.close(); return end
+      os.sleep(0.05)
+    end
+    req.close()
+  end)
+end
+recoverPreviousLog()
 
 -- ── startup ───────────────────────────────────
 dbg("=== craft_oc.lua starting ===")

@@ -53,11 +53,22 @@ end
 local net = component.internet
 local SCRIPT_NAME = "claude_chat_oc"
 
--- ── debug logger (mirrors errors/status to the web viewer) ────
+-- ── crash-resistant local log file ─────────────
+-- flushDebug() only sends what's buffered in memory, and only when we
+-- call it -- a genuinely unexpected crash skips past that entirely and
+-- OC's own crash handler prints a traceback to the LOCAL terminal
+-- only, never the web viewer. Writing every dbg() line straight to
+-- disk means the log survives even a hard crash, and gets
+-- auto-recovered and pushed to the web the *next* time this starts.
+local LOG_FILE = DISK.."/oc_log_"..SCRIPT_NAME..".txt"
+
+-- ── debug logger (mirrors errors/status to the web viewer + disk) ──
 local debugLines = {}
 
 local function dbg(text)
   debugLines[#debugLines+1] = text
+  local lf = io.open(LOG_FILE, "a")
+  if lf then lf:write(text.."\n"); lf:close() end
 end
 
 local function flushDebug(label)
@@ -80,6 +91,34 @@ local function flushDebug(label)
     req.close()
   end)
 end
+
+-- ── recover + push any log left over from a crashed previous run ──
+local function recoverPreviousLog()
+  local f = io.open(LOG_FILE, "r")
+  if not f then return end
+  local prev = f:read("*a")
+  f:close()
+  local wf = io.open(LOG_FILE, "w")
+  if wf then wf:close() end
+  if not prev or prev == "" then return end
+  local full = "["..SCRIPT_NAME.."] recovered-from-previous-crash:\n"..prev
+  local body = '{"role":"diag","text":"'
+               ..full:gsub('\\','\\\\'):gsub('"','\\"'):gsub('\n','\\n')
+               ..'"}'
+  pcall(function()
+    local req = net.request(SERVER.."/log", body, {["Content-Type"]="application/json"})
+    if not req then return end
+    local dl = computer.uptime()+5
+    while computer.uptime()<dl do
+      local ok = req.finishConnect()
+      if ok then break end
+      if ok==nil then req.close(); return end
+      os.sleep(0.05)
+    end
+    req.close()
+  end)
+end
+recoverPreviousLog()
 
 -- ── HTTP POST ─────────────────────────────────
 local function post(path, tbl)

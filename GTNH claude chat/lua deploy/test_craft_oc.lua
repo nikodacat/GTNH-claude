@@ -31,10 +31,18 @@ do
   end
 end
 
+-- ── crash-resistant local log file ─────────────
+-- Written unconditionally (doesn't need SERVER) so a hard crash still
+-- leaves a trail on disk; auto-recovered and pushed to the web the
+-- *next* time this script starts, if a server is configured by then.
+local LOG_FILE = DISK.."/oc_log_"..SCRIPT_NAME..".txt"
+
 local debugLines = {}
 local function dbg(text)
   print(text)
   debugLines[#debugLines+1] = text
+  local lf = io.open(LOG_FILE, "a")
+  if lf then lf:write(text.."\n"); lf:close() end
 end
 local function flushDebug(label)
   if not net or #debugLines == 0 then debugLines = {}; return end
@@ -56,6 +64,34 @@ local function flushDebug(label)
     req.close()
   end)
 end
+
+-- ── recover + push any log left over from a crashed previous run ──
+local function recoverPreviousLog()
+  local f = io.open(LOG_FILE, "r")
+  if not f then return end
+  local prev = f:read("*a")
+  f:close()
+  local wf = io.open(LOG_FILE, "w")
+  if wf then wf:close() end
+  if not prev or prev == "" or not net then return end
+  local full = "["..SCRIPT_NAME.."] recovered-from-previous-crash:\n"..prev
+  local body = '{"role":"diag","text":"'
+               ..full:gsub('\\','\\\\'):gsub('"','\\"'):gsub('\n','\\n')
+               ..'"}'
+  pcall(function()
+    local req = net.request(SERVER.."/log", body, {["Content-Type"]="application/json"})
+    if not req then return end
+    local dl = computer.uptime()+5
+    while computer.uptime()<dl do
+      local ok = req.finishConnect()
+      if ok then break end
+      if ok==nil then req.close(); return end
+      os.sleep(0.05)
+    end
+    req.close()
+  end)
+end
+recoverPreviousLog()
 
 if not component.isAvailable("me_controller") then
   dbg("[FAIL] No me_controller component."); flushDebug("hw-fail"); return
