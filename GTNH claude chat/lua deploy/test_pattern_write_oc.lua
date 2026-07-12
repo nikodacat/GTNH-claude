@@ -55,23 +55,58 @@ end
 local cfg = loadConfig()
 if not cfg then return end
 local SERVER = cfg.SERVER
-if not component.isAvailable("me_controller") then print("[FAIL] no me_controller"); return end
+local SCRIPT_NAME = "test_pattern_write_oc"
+local net = component.internet
+
+-- ── debug logger (mirrors all output to the web viewer) ───────
+local debugLines = {}
+local function dbg(text)
+  local t = string.format("[%.1fs] %s", computer.uptime(), text)
+  print(t)
+  debugLines[#debugLines+1] = t
+end
+local function flushDebug(label)
+  if #debugLines == 0 then return end
+  local full = "["..SCRIPT_NAME.."] "..(label or "log")..":\n"..table.concat(debugLines, "\n")
+  debugLines = {}
+  local body = '{"role":"diag","text":"'
+               ..full:gsub('\\','\\\\'):gsub('"','\\"'):gsub('\n','\\n')
+               ..'"}'
+  pcall(function()
+    local req = net.request(SERVER.."/log", body, {["Content-Type"]="application/json"})
+    if not req then return end
+    local dl = computer.uptime()+5
+    while computer.uptime()<dl do
+      local ok = req.finishConnect()
+      if ok then break end
+      if ok==nil then req.close(); return end
+      os.sleep(0.05)
+    end
+    req.close()
+  end)
+end
+
+if not component.isAvailable("me_controller") then
+  dbg("[FAIL] no me_controller"); flushDebug("hw-fail"); return
+end
 if not component.isAvailable("me_interface") then
-  print("[FAIL] no me_interface component found.")
-  print("       Connect an OC Adapter to a spare ME Interface block")
-  print("       (not wired to any machine -- this one is a pattern buffer).")
+  dbg("[FAIL] no me_interface component found.")
+  dbg("       Connect an OC Adapter to a spare ME Interface block")
+  dbg("       (not wired to any machine -- this one is a pattern buffer).")
+  flushDebug("hw-fail")
   return
 end
 if not component.isAvailable("database") then
-  print("[FAIL] no database component found.")
-  print("       Connect an OC Adapter to a Database Upgrade (any tier).")
+  dbg("[FAIL] no database component found.")
+  dbg("       Connect an OC Adapter to a Database Upgrade (any tier).")
+  flushDebug("hw-fail")
   return
 end
 
-local net = component.internet
 local me  = component.me_controller
 local iface = component.me_interface
 local db  = component.database
+flushDebug("hw-ok")
 
 -- ── minimal HTTP GET ──────────────────────────
 local function get(path)
@@ -147,7 +182,7 @@ local function resolveOreTag(tag)
     end
   end
   if not best then return nil, "no match in network for "..tag end
-  print(string.format("  [NOTE] resolved %s -> %s (damage=%d, label=%s, you have %d)",
+  dbg(string.format("  [NOTE] resolved %s -> %s (damage=%d, label=%s, you have %d)",
     tag, best.name, best.damage or 0, best.label or "?", best.size or 0))
   return best.name, best.damage or 0
 end
@@ -172,26 +207,31 @@ print("=== Pattern Writer Test ===")
 io.write("Exact output item to craft (e.g. minecraft:stick or gregtech:gt.metaitem.01:810): ")
 local itemName = io.read()
 if not itemName or itemName=="" then print("cancelled"); return end
+dbg("target item: "..itemName)
 
-print("Looking up recipe from server...")
+dbg("Looking up recipe from server...")
 local encoded = itemName:gsub(":","%%3A")
 local raw, err = get("/recipe?item="..encoded)
-if not raw then print("[FAIL] server request failed: "..tostring(err)); return end
-if not raw:find('"found":%s*true') then print("[FAIL] no recipe found for "..itemName); return end
+if not raw then
+  dbg("[FAIL] server request failed: "..tostring(err)); flushDebug("recipe-fail"); return
+end
+if not raw:find('"found":%s*true') then
+  dbg("[FAIL] no recipe found for "..itemName); flushDebug("recipe-fail"); return
+end
 
 local rtype = extractStr(raw,"type")
-print("Recipe type: "..tostring(rtype))
+dbg("Recipe type: "..tostring(rtype))
 
 local ingredientEntries = {}
 if rtype=="crafting_shaped" then
   local grid = extractArr(raw,"grid")
-  if not grid then print("[FAIL] couldn't parse grid"); return end
+  if not grid then dbg("[FAIL] couldn't parse grid"); flushDebug("parse-fail"); return end
   for i,v in ipairs(grid) do
     if v then ingredientEntries[#ingredientEntries+1] = {slot=i-1, entry=v} end
   end
 elseif rtype=="crafting_shapeless" then
   local ing = extractArr(raw,"ingredients")
-  if not ing then print("[FAIL] couldn't parse ingredients"); return end
+  if not ing then dbg("[FAIL] couldn't parse ingredients"); flushDebug("parse-fail"); return end
   -- aggregate duplicate entries into counts
   local counts, order = {}, {}
   for _,v in ipairs(ing) do
@@ -204,50 +244,61 @@ elseif rtype=="crafting_shapeless" then
     ingredientEntries[#ingredientEntries+1] = {slot=i-1, entry=v, count=counts[v]}
   end
 else
-  print("[FAIL] unsupported recipe type: "..tostring(rtype).." (only crafting_shaped/shapeless handled)")
+  dbg("[FAIL] unsupported recipe type: "..tostring(rtype).." (only crafting_shaped/shapeless handled)")
+  flushDebug("unsupported-type")
   return
 end
 
-print(#ingredientEntries.." ingredient slot(s) to resolve:")
+dbg(#ingredientEntries.." ingredient slot(s) to resolve:")
 local resolved = {}
 for _,ie in ipairs(ingredientEntries) do
-  print("  slot "..ie.slot..": "..ie.entry)
+  dbg("  slot "..ie.slot..": "..ie.entry)
   local id,dmg = resolveEntry(ie.entry)
   if not id then
-    print("  [FAIL] could not resolve ingredient: "..ie.entry)
+    dbg("  [FAIL] could not resolve ingredient: "..ie.entry)
+    flushDebug("resolve-fail")
     return
   end
   resolved[#resolved+1] = {slot=ie.slot, id=id, damage=dmg, count=ie.count or 1}
 end
+flushDebug("ingredients-resolved")
 
 -- ── write into pattern slot 0 of the buffer interface ──
 local PATTERN_INDEX = 0
 print()
-print("Clearing pattern slot "..PATTERN_INDEX.." on buffer interface...")
+dbg("Clearing pattern slot "..PATTERN_INDEX.." on buffer interface...")
 clearPattern(PATTERN_INDEX, 9, 4)
 
-print("Staging + writing "..#resolved.." input(s)...")
+dbg("Staging + writing "..#resolved.." input(s)...")
 local dbSlot = 0
 for _, r in ipairs(resolved) do
   local ok, err2 = db.set(dbSlot, r.id, r.damage)
-  if not ok then print("[FAIL] database.set failed: "..tostring(err2)); return end
+  if not ok then
+    dbg("[FAIL] database.set failed: "..tostring(err2)); flushDebug("write-fail"); return
+  end
   local ok2, err3 = iface.setInterfacePatternInput(PATTERN_INDEX, db.address, dbSlot, r.count, r.slot)
-  if not ok2 then print("[FAIL] setInterfacePatternInput failed: "..tostring(err3)); return end
+  if not ok2 then
+    dbg("[FAIL] setInterfacePatternInput failed: "..tostring(err3)); flushDebug("write-fail"); return
+  end
   dbSlot = dbSlot + 1
 end
 
-print("Staging + writing output...")
+dbg("Staging + writing output...")
 local outId, outDmg = splitItemId(itemName)
 local ok4 = db.set(dbSlot, outId, outDmg)
-if not ok4 then print("[FAIL] database.set (output) failed"); return end
+if not ok4 then
+  dbg("[FAIL] database.set (output) failed"); flushDebug("write-fail"); return
+end
 local ok5, err5 = iface.setInterfacePatternOutput(PATTERN_INDEX, db.address, dbSlot, 1, 0)
-if not ok5 then print("[FAIL] setInterfacePatternOutput failed: "..tostring(err5)); return end
+if not ok5 then
+  dbg("[FAIL] setInterfacePatternOutput failed: "..tostring(err5)); flushDebug("write-fail"); return
+end
 
-print("[OK] Pattern written.")
+dbg("[OK] Pattern written.")
 print()
 
 -- ── verify it shows up as craftable ──
-print("Checking me.getCraftables() for confirmation (may take a moment)...")
+dbg("Checking me.getCraftables() for confirmation (may take a moment)...")
 os.sleep(1)
 local ok6, craftables = pcall(me.getCraftables)
 local found = false
@@ -257,11 +308,12 @@ if ok6 and craftables then
   end
 end
 if found then
-  print("[SUCCESS] "..outId.." now appears in getCraftables().")
+  dbg("[SUCCESS] "..outId.." now appears in getCraftables().")
 else
-  print("[WARN] "..outId.." not yet showing as craftable.")
-  print("       Check in-game: does the buffer ME Interface show the")
-  print("       new pattern in its GUI? Is it connected to the network")
-  print("       with enough channels, and is a Molecular Assembler or")
-  print("       Crafting CPU available for the network to use it?")
+  dbg("[WARN] "..outId.." not yet showing as craftable.")
+  dbg("       Check in-game: does the buffer ME Interface show the")
+  dbg("       new pattern in its GUI? Is it connected to the network")
+  dbg("       with enough channels, and is a Molecular Assembler or")
+  dbg("       Crafting CPU available for the network to use it?")
 end
+flushDebug("pattern-write-"..(found and "success" or "unconfirmed"))

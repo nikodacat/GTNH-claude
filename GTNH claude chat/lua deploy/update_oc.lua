@@ -48,6 +48,50 @@ if not component.isAvailable("internet") then
   print("[FAIL] No Internet Card."); return
 end
 local net = component.internet
+local SCRIPT_NAME = "update_oc"
+
+-- ── optional remote logging (best-effort) ──────
+-- Reads config.lua (never writes to it -- that stays local-only,
+-- see FILES list below) just to find SERVER, so update results can
+-- also be seen on the web viewer without needing to read the OC
+-- screen. If there's no config yet, this just runs silently local-only.
+local SERVER
+do
+  local f = io.open(DISK.."/config.lua", "r")
+  if f then
+    f:close()
+    local ok, cfg = pcall(dofile, DISK.."/config.lua")
+    if ok and type(cfg)=="table" and cfg.SERVER and not cfg.SERVER:find("YOUR_HAMACHI_IP") then
+      SERVER = cfg.SERVER
+    end
+  end
+end
+
+local debugLines = {}
+local function dbg(text)
+  print(text)
+  debugLines[#debugLines+1] = text
+end
+local function flushDebug(label)
+  if not SERVER or #debugLines == 0 then debugLines = {}; return end
+  local full = "["..SCRIPT_NAME.."] "..(label or "log")..":\n"..table.concat(debugLines, "\n")
+  debugLines = {}
+  local body = '{"role":"diag","text":"'
+               ..full:gsub('\\','\\\\'):gsub('"','\\"'):gsub('\n','\\n')
+               ..'"}'
+  pcall(function()
+    local req = net.request(SERVER.."/log", body, {["Content-Type"]="application/json"})
+    if not req then return end
+    local dl = computer.uptime()+5
+    while computer.uptime()<dl do
+      local ok = req.finishConnect()
+      if ok then break end
+      if ok==nil then req.close(); return end
+      os.sleep(0.05)
+    end
+    req.close()
+  end)
+end
 
 local function fetch(url)
   local req, err = net.request(url)
@@ -69,9 +113,9 @@ local function fetch(url)
   return body
 end
 
-print("=== Updating scripts from GitHub ===")
-print("Source: " .. REPO_RAW)
-print()
+dbg("=== Updating scripts from GitHub ===")
+dbg("Source: " .. REPO_RAW)
+dbg("")
 
 local okCount, failCount = 0, 0
 for _, base in ipairs(FILES) do
@@ -79,36 +123,43 @@ for _, base in ipairs(FILES) do
   io.write("  " .. name .. " ... ")
   local body, err = fetch(REPO_RAW .. name)
   if not body or body == "" then
-    print("[FAIL] " .. tostring(err or "empty response"))
+    local msg = "[FAIL] " .. tostring(err or "empty response")
+    print(msg)
+    debugLines[#debugLines+1] = "  " .. name .. " ... " .. msg
     failCount = failCount + 1
   else
     local path = targetPath(base)
     local f, ferr = io.open(path, "w")
     if not f then
-      print("[FAIL] couldn't write " .. path .. ": " .. tostring(ferr))
+      local msg = "[FAIL] couldn't write " .. path .. ": " .. tostring(ferr)
+      print(msg)
+      debugLines[#debugLines+1] = "  " .. name .. " ... " .. msg
       failCount = failCount + 1
     else
       f:write(body)
       f:close()
-      print("OK (" .. #body .. " bytes)")
+      local msg = "OK (" .. #body .. " bytes)"
+      print(msg)
+      debugLines[#debugLines+1] = "  " .. name .. " ... " .. msg
       okCount = okCount + 1
     end
   end
 end
 
-print()
-print(string.format("Done. %d updated, %d failed.", okCount, failCount))
+dbg("")
+dbg(string.format("Done. %d updated, %d failed.", okCount, failCount))
 if failCount > 0 then
-  print("[!] If fetches failed, check the repo is public and the")
-  print("    filenames in FILES still match what's on GitHub.")
+  dbg("[!] If fetches failed, check the repo is public and the")
+  dbg("    filenames in FILES still match what's on GitHub.")
 end
 
 local hasConfig = io.open(DISK .. "/config.lua", "r")
 if hasConfig then
   hasConfig:close()
-  print("[i] config.lua left untouched, as intended.")
+  dbg("[i] config.lua left untouched, as intended.")
 else
-  print("[!] No config.lua found -- copy config.example.lua to")
-  print("    " .. DISK .. "/config.lua and set your SERVER ip")
-  print("    before running craft_oc.lua / claude_chat_oc.lua.")
+  dbg("[!] No config.lua found -- copy config.example.lua to")
+  dbg("    " .. DISK .. "/config.lua and set your SERVER ip")
+  dbg("    before running craft_oc.lua / claude_chat_oc.lua.")
 end
+flushDebug("update-"..(failCount==0 and "success" or "partial-fail"))

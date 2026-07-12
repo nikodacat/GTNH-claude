@@ -9,22 +9,71 @@
 local component = require("component")
 local computer  = require("computer")
 
+local DISK = "/mnt/e10"
+local SCRIPT_NAME = "test_craft_oc"
+
+-- ── optional remote logging (best-effort, never blocks the test) ──
+-- If config.lua + an internet card are present, mirror output to the
+-- web viewer. If not, this script still works exactly as before --
+-- it's a standalone AE2 test and shouldn't require the server.
+local net, SERVER
+do
+  local f = io.open(DISK.."/config.lua", "r")
+  if f then
+    f:close()
+    local ok, cfg = pcall(dofile, DISK.."/config.lua")
+    if ok and type(cfg)=="table" and cfg.SERVER and not cfg.SERVER:find("YOUR_HAMACHI_IP") then
+      if component.isAvailable("internet") then
+        net = component.internet
+        SERVER = cfg.SERVER
+      end
+    end
+  end
+end
+
+local debugLines = {}
+local function dbg(text)
+  print(text)
+  debugLines[#debugLines+1] = text
+end
+local function flushDebug(label)
+  if not net or #debugLines == 0 then debugLines = {}; return end
+  local full = "["..SCRIPT_NAME.."] "..(label or "log")..":\n"..table.concat(debugLines, "\n")
+  debugLines = {}
+  local body = '{"role":"diag","text":"'
+               ..full:gsub('\\','\\\\'):gsub('"','\\"'):gsub('\n','\\n')
+               ..'"}'
+  pcall(function()
+    local req = net.request(SERVER.."/log", body, {["Content-Type"]="application/json"})
+    if not req then return end
+    local dl = computer.uptime()+5
+    while computer.uptime()<dl do
+      local ok = req.finishConnect()
+      if ok then break end
+      if ok==nil then req.close(); return end
+      os.sleep(0.05)
+    end
+    req.close()
+  end)
+end
+
 if not component.isAvailable("me_controller") then
-  print("[FAIL] No me_controller component."); return
+  dbg("[FAIL] No me_controller component."); flushDebug("hw-fail"); return
 end
 local me = component.me_controller
 
-print("=== AE2 Craftables ===")
+dbg("=== AE2 Craftables ===")
 local ok, craftables = pcall(me.getCraftables)
 if not ok or not craftables then
-  print("[FAIL] getCraftables() failed: "..tostring(craftables)); return
+  dbg("[FAIL] getCraftables() failed: "..tostring(craftables)); flushDebug("hw-fail"); return
 end
-print("Found "..#craftables.." craftable pattern(s).")
+dbg("Found "..#craftables.." craftable pattern(s).")
 print()
 print("Listing all craftable item names (may scroll off-screen):")
 for i, c in ipairs(craftables) do
   print(string.format("  [%d] %s", i, c.name or "?"))
 end
+flushDebug("craftables-list")
 
 print()
 io.write("Enter EXACT item name to test-craft (e.g. minecraft:stick): ")
@@ -40,18 +89,20 @@ for _, c in ipairs(craftables) do
   if c.name == itemName then target = c; break end
 end
 if not target then
-  print("[FAIL] No craftable pattern found for exact name: "..itemName)
-  print("       Check spelling/case against the list above --")
-  print("       this is the #1 cause of silent 'explain' fallback.")
+  dbg("[FAIL] No craftable pattern found for exact name: "..itemName)
+  dbg("       Check spelling/case against the list above --")
+  dbg("       this is the #1 cause of silent 'explain' fallback.")
+  flushDebug("no-pattern")
   return
 end
 
-print("[OK] Pattern found. Requesting "..amount.."x "..itemName.."...")
+dbg("[OK] Pattern found. Requesting "..amount.."x "..itemName.."...")
 local ok2, job = pcall(function() return target.request(amount) end)
 if not ok2 then
-  print("[FAIL] request() threw: "..tostring(job)); return
+  dbg("[FAIL] request() threw: "..tostring(job)); flushDebug("request-fail"); return
 end
-print("[OK] Job submitted. Polling (up to 60s)...")
+dbg("[OK] Job submitted. Polling (up to 60s)...")
+flushDebug("job-submitted")
 
 local deadline = computer.uptime() + 60
 while computer.uptime() < deadline do
@@ -59,14 +110,18 @@ while computer.uptime() < deadline do
   io.write(".")
   local ok3, done = pcall(function() return job.isDone() end)
   local ok4, cancelled = pcall(function() return job.isCanceled() end)
-  if ok3 and done then print(); print("[SUCCESS] Craft finished."); return end
+  if ok3 and done then
+    print(); dbg("[SUCCESS] Craft finished."); flushDebug("craft-success"); return
+  end
   if ok4 and cancelled then
     print()
-    print("[FAIL] Job cancelled by AE2 -- usually means missing")
-    print("       ingredients in the network, or no free Crafting CPU.")
+    dbg("[FAIL] Job cancelled by AE2 -- usually means missing")
+    dbg("       ingredients in the network, or no free Crafting CPU.")
+    flushDebug("craft-cancelled")
     return
   end
 end
 print()
-print("[TIMEOUT] Job didn't finish in 60s -- check Crafting CPU status")
-print("          and ingredient stock in-game.")
+dbg("[TIMEOUT] Job didn't finish in 60s -- check Crafting CPU status")
+dbg("          and ingredient stock in-game.")
+flushDebug("craft-timeout")

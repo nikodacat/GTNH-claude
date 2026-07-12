@@ -35,6 +35,7 @@ local function loadConfig()
 end
 
 local SERVER = loadConfig().SERVER
+local SCRIPT_NAME = "craft_oc"
 
 -- ── debug logger ──────────────────────────────
 local debugLines = {}
@@ -48,7 +49,7 @@ end
 local function flushDebug(label)
   if not component.isAvailable("internet") then return end
   local net  = component.internet
-  local full = (label or "debug") .. ":\n" .. table.concat(debugLines, "\n")
+  local full = "["..SCRIPT_NAME.."] "..(label or "debug") .. ":\n" .. table.concat(debugLines, "\n")
   debugLines = {}
   local body = '{"role":"diag","text":"'
                .. full:gsub('\\','\\\\'):gsub('"','\\"'):gsub('\n','\\n')
@@ -482,6 +483,7 @@ while true do
     local n=0; for _ in pairs(inv) do n=n+1 end
     cprint(0x00FFFF,string.format(
       "done.\n  ME items   : %d types\n  Craftables : %d patterns",n,#c))
+    dbg(string.format("status result: %d item types, %d craftable patterns",n,#c))
     flushDebug("status")
 
   elseif input:lower():match("^search%s+") then
@@ -489,10 +491,13 @@ while true do
     dbg("search: "..q)
     cwrite(0x888888,"[~] Searching '"..q.."'... ")
     local results=searchItems(q,10)
-    if #results==0 then cprint(0xFFAA00,"no matches.")
+    if #results==0 then
+      cprint(0xFFAA00,"no matches.")
+      dbg("search result: no matches")
     else
       cprint(0x00FF00,#results.." result(s):")
       for _,r in ipairs(results) do cprint(0x00FFFF,"  "..r) end
+      dbg("search result ("..#results.."): "..table.concat(results,", "))
     end
     flushDebug("search-"..q)
 
@@ -582,12 +587,20 @@ while true do
 
     if action=="craft" and item and item~="null" then
       cprint(0xFFFF00,string.format("\n[Autocraft] %s x%d",item,amount))
+      dbg("autocraft start: "..item.." x"..amount)
       local ok,aerr=triggerAutocraft(item,amount)
-      if ok then cprint(0x00FF00,"  [+] Done!")
-      else cprint(0xFF4444,"  [!] "..(aerr or "failed")) end
+      if ok then
+        cprint(0x00FF00,"  [+] Done!")
+        dbg("autocraft result: SUCCESS")
+      else
+        cprint(0xFF4444,"  [!] "..(aerr or "failed"))
+        dbg("autocraft result: FAILED - "..(aerr or "failed"))
+      end
+      flushDebug("autocraft-"..item)
     elseif action=="explain" then
       cprint(0xFFAA00,"\n[No pattern] Cannot autocraft — see recipe above.")
       cprint(0x888888,"  -> Encode a pattern in ME Pattern Terminal to enable.")
+      dbg("explain-only response, no AE2 pattern for this item")
     end
 
     flushDebug("request-"..input:sub(1,20))

@@ -51,6 +51,35 @@ if SERVER:find("YOUR_HAMACHI_IP") then
 end
 
 local net = component.internet
+local SCRIPT_NAME = "claude_chat_oc"
+
+-- ── debug logger (mirrors errors/status to the web viewer) ────
+local debugLines = {}
+
+local function dbg(text)
+  debugLines[#debugLines+1] = text
+end
+
+local function flushDebug(label)
+  if #debugLines == 0 then return end
+  local full = "["..SCRIPT_NAME.."] "..(label or "log")..":\n"..table.concat(debugLines, "\n")
+  debugLines = {}
+  local body = '{"role":"diag","text":"'
+               ..full:gsub('\\','\\\\'):gsub('"','\\"'):gsub('\n','\\n')
+               ..'"}'
+  pcall(function()
+    local req = net.request(SERVER.."/log", body, {["Content-Type"]="application/json"})
+    if not req then return end
+    local dl = computer.uptime()+5
+    while computer.uptime()<dl do
+      local ok = req.finishConnect()
+      if ok then break end
+      if ok==nil then req.close(); return end
+      os.sleep(0.05)
+    end
+    req.close()
+  end)
+end
 
 -- ── HTTP POST ─────────────────────────────────
 local function post(path, tbl)
@@ -153,9 +182,11 @@ local function pingServer()
     fg(0xFF4444); print("FAILED")
     fg(0xFFFFFF); print("    ".. (err or "?"))
     print("    Is claude_server.py running on your PC?")
+    dbg("ping FAILED: "..(err or "?"))
     return false
   end
   fg(0x00FF00); print("OK"); fg(0xFFFFFF)
+  dbg("ping OK")
   return true
 end
 
@@ -168,8 +199,10 @@ fg(0x888888); print("Server: "..SERVER)
 print()
 
 if not pingServer() then
+  flushDebug("startup-fail")
   io.read(); os.exit()
 end
+flushDebug("startup-ok")
 
 fg(0x888888); print("Type 'quit' to exit.\n")
 fg(0xFFFFFF)
@@ -191,6 +224,8 @@ while true do
   local raw, err = post("/chat", {messages=history, source="oc"})
   if not raw then
     fg(0xFF4444); print("[ERR] "..(err or "?")); fg(0xFFFFFF)
+    dbg("POST /chat FAILED: "..(err or "?"))
+    flushDebug("chat-post-fail")
     history[#history]=nil
     goto continue
   end
@@ -198,6 +233,8 @@ while true do
   local reply, rerr = getReply(raw)
   if not reply then
     fg(0xFF4444); print("[ERR] "..(rerr or raw)); fg(0xFFFFFF)
+    dbg("getReply FAILED: "..(rerr or raw))
+    flushDebug("chat-reply-fail")
     history[#history]=nil
     goto continue
   end
@@ -207,10 +244,15 @@ while true do
   if hasCJK then
     fg(0xFFAA00); print("[!] Full reply on web viewer (contains non-ASCII).")
     fg(0xFFFFFF)
+    dbg("reply contained CJK, sent ASCII-safe notice to OC")
   end
 
   history[#history+1] = {role="assistant", content=reply}
   printWrapped(0x00FFFF, "Claude: ", reply)
+  -- note: the full player/claude exchange is already mirrored to the
+  -- web viewer by the server itself (via /chat's append_log calls),
+  -- so we only need to flush our own status/error lines here.
+  flushDebug("chat-ok")
 
   ::continue::
 end
