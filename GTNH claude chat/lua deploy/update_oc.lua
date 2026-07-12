@@ -27,6 +27,7 @@ local FILES = {
   "lookup_item_name_oc",
   "test_craft_oc",
   "test_pattern_write_oc",
+  "diag_pattern_editor_oc",
   "config.example",
   "update_oc",
 }
