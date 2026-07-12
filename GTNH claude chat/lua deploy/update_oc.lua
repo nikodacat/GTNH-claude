@@ -90,4 +90,25 @@ for _, base in ipairs(FILES) do
     else
       f:write(body)
       f:close()
-      print("OK (" .. #body
+      print("OK (" .. #body .. " bytes)")
+      okCount = okCount + 1
+    end
+  end
+end
+
+print()
+print(string.format("Done. %d updated, %d failed.", okCount, failCount))
+if failCount > 0 then
+  print("[!] If fetches failed, check the repo is public and the")
+  print("    filenames in FILES still match what's on GitHub.")
+end
+
+local hasConfig = io.open(DISK .. "/config.lua", "r")
+if hasConfig then
+  hasConfig:close()
+  print("[i] config.lua left untouched, as intended.")
+else
+  print("[!] No config.lua found -- copy config.example.lua to")
+  print("    " .. DISK .. "/config.lua and set your SERVER ip")
+  print("    before running craft_oc.lua / claude_chat_oc.lua.")
+end
