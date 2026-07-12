@@ -196,10 +196,31 @@ local function resolveEntry(entry)
   end
 end
 
+-- ── safe wrapper: some component methods (e.g. database.set with an
+-- out-of-range slot) throw a hard Lua error instead of returning
+-- (false, err). An uncaught throw here skips right past our own
+-- dbg()/flushDebug() error handling and crashes the whole script --
+-- OC's own crash handler prints a traceback to the LOCAL terminal only,
+-- so it never reaches the web viewer. Routing every risky call through
+-- this wrapper means ANY failure, thrown or returned, gets reported.
+local function safeCall(fn, ...)
+  local callOk, a, b = pcall(fn, ...)
+  if not callOk then
+    return false, a  -- a holds the pcall error message
+  end
+  return a, b
+end
+
 -- ── clear all input/output slots of a pattern before rewriting ──
 local function clearPattern(patternIndex, maxIn, maxOut)
-  for i=0,maxIn-1  do pcall(iface.clearInterfacePatternInput,  patternIndex, i) end
-  for o=0,maxOut-1 do pcall(iface.clearInterfacePatternOutput, patternIndex, o) end
+  for i=0,maxIn-1  do
+    local ok, err = safeCall(iface.clearInterfacePatternInput, patternIndex, i)
+    if not ok then dbg("  [NOTE] clearInterfacePatternInput("..i..") failed: "..tostring(err)) end
+  end
+  for o=0,maxOut-1 do
+    local ok, err = safeCall(iface.clearInterfacePatternOutput, patternIndex, o)
+    if not ok then dbg("  [NOTE] clearInterfacePatternOutput("..o..") failed: "..tostring(err)) end
+  end
 end
 
 -- ── main ──────────────────────────────────────
@@ -270,28 +291,31 @@ dbg("Clearing pattern slot "..PATTERN_INDEX.." on buffer interface...")
 clearPattern(PATTERN_INDEX, 9, 4)
 
 dbg("Staging + writing "..#resolved.." input(s)...")
-local dbSlot = 0
+-- NOTE: database upgrade slots are 1-indexed in OC (like most OC
+-- inventory-style slot APIs -- robot.select, transposer slots, etc.),
+-- NOT 0-indexed. Starting at 0 throws "invalid slot" immediately.
+local dbSlot = 1
 for _, r in ipairs(resolved) do
-  local ok, err2 = db.set(dbSlot, r.id, r.damage)
+  local ok, err2 = safeCall(db.set, dbSlot, r.id, r.damage)
   if not ok then
-    dbg("[FAIL] database.set failed: "..tostring(err2)); flushDebug("write-fail"); return
+    dbg("[FAIL] database.set failed (slot "..dbSlot.."): "..tostring(err2)); flushDebug("write-fail"); return
   end
-  local ok2, err3 = iface.setInterfacePatternInput(PATTERN_INDEX, db.address, dbSlot, r.count, r.slot)
+  local ok2, err3 = safeCall(iface.setInterfacePatternInput, PATTERN_INDEX, db.address, dbSlot, r.count, r.slot)
   if not ok2 then
-    dbg("[FAIL] setInterfacePatternInput failed: "..tostring(err3)); flushDebug("write-fail"); return
+    dbg("[FAIL] setInterfacePatternInput failed (slot "..dbSlot..", grid "..r.slot.."): "..tostring(err3)); flushDebug("write-fail"); return
   end
   dbSlot = dbSlot + 1
 end
 
 dbg("Staging + writing output...")
 local outId, outDmg = splitItemId(itemName)
-local ok4 = db.set(dbSlot, outId, outDmg)
+local ok4, err4 = safeCall(db.set, dbSlot, outId, outDmg)
 if not ok4 then
-  dbg("[FAIL] database.set (output) failed"); flushDebug("write-fail"); return
+  dbg("[FAIL] database.set (output) failed (slot "..dbSlot.."): "..tostring(err4)); flushDebug("write-fail"); return
 end
-local ok5, err5 = iface.setInterfacePatternOutput(PATTERN_INDEX, db.address, dbSlot, 1, 0)
+local ok5, err5 = safeCall(iface.setInterfacePatternOutput, PATTERN_INDEX, db.address, dbSlot, 1, 0)
 if not ok5 then
-  dbg("[FAIL] setInterfacePatternOutput failed: "..tostring(err5)); flushDebug("write-fail"); return
+  dbg("[FAIL] setInterfacePatternOutput failed (slot "..dbSlot.."): "..tostring(err5)); flushDebug("write-fail"); return
 end
 
 dbg("[OK] Pattern written.")
