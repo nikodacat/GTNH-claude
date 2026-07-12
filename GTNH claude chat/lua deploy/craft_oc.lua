@@ -4,7 +4,7 @@
 --  with debug logging to terminal + web viewer.
 -- =============================================
 
-local DISK   = "/mnt/e10"   -- where scripts + config live
+local DISK   = "/mnt/dc6"   -- where scripts + config live
 
 local component = require("component")
 local computer  = require("computer")

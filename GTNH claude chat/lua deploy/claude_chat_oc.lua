@@ -4,7 +4,7 @@
 --  Requires: Internet Card only
 -- =============================================
 
-local DISK = "/mnt/e10"   -- where scripts + config live
+local DISK = "/mnt/dc6"   -- where scripts + config live
 
 -- ── libs ─────────────────────────────────────
 local component = require("component")

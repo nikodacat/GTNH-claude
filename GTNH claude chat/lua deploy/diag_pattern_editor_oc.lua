@@ -20,7 +20,7 @@
 local component = require("component")
 local computer  = require("computer")
 
-local DISK = "/mnt/e10"
+local DISK = "/mnt/dc6"
 local SCRIPT_NAME = "diag_pattern_editor_oc"
 
 -- ── optional remote logging (best-effort) ──────

@@ -8,7 +8,7 @@ local component = require("component")
 local computer  = require("computer")
 local io        = require("io")
 
-local DISK = "/mnt/e10"
+local DISK = "/mnt/dc6"
 local SCRIPT_NAME = "diag_oc"
 
 -- ── optional remote logging (best-effort) ──────

@@ -3,7 +3,7 @@
 --  Template for local, per-machine settings.
 --
 --  Copy this file to config.lua on your OC disk
---  (same folder as the scripts, e.g. /mnt/e10/config.lua)
+--  (same folder as the scripts, e.g. /mnt/dc6/config.lua)
 --  and fill in your real server address.
 --
 --  config.lua itself is NOT tracked in git -- it's

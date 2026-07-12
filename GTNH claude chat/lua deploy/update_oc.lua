@@ -13,7 +13,7 @@ local computer  = require("computer")
 local io        = require("io")
 local os        = require("os")
 
-local DISK      = "/mnt/e10"
+local DISK      = "/mnt/dc6"
 local HOME      = "/home"
 local REPO_RAW  = "https://raw.githubusercontent.com/nikodacat/GTNH-claude/main/GTNH%20claude%20chat/lua%20deploy/"
 
