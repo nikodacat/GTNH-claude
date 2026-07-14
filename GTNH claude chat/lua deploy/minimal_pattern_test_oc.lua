@@ -13,12 +13,45 @@
 --      Terminal) sitting in slot 1
 --    - database (any tier)
 --
---  Hardcoded recipe: 2x minecraft:planks:0 (oak) ->
---  4x minecraft:stick:0. Real, shapeless, vanilla
---  recipe -- if THIS doesn't validate, the bug is in
---  the OC Pattern Editor mechanism itself (or this
---  physical pattern item), not in anything our other
---  scripts were doing on top of it.
+--  ROOT CAUSE FOUND 2026-07-14 (this is the fixed
+--  version): the first attempt at this test wrote
+--  "2x minecraft:planks:0" into a SINGLE grid index
+--  with count=2. That's wrong. Fetched the real,
+--  current source (PatternHelper.java, GTNewHorizons/
+--  Applied-Energistics-2-Unofficial) and confirmed
+--  Minecraft's own shapeless-recipe matcher checks
+--  ONE NON-EMPTY GRID SLOT PER REQUIRED INGREDIENT
+--  ENTRY -- it never looks at stack count. Sticks'
+--  real recipe has TWO separate "1 plank" ingredient
+--  entries, so it needs TWO separate occupied grid
+--  slots, each holding 1 plank -- a single slot with
+--  a stack of 2 never matches, no matter what count
+--  we write. This version writes plank #1 to grid
+--  index 1 and plank #2 to grid index 2, both count=1.
+--
+--  Also confirmed from source: getPatternForItem()
+--  catches ALL exceptions from PatternHelper's
+--  constructor and returns null instead of letting
+--  them propagate -- so getOutput() (which the OC
+--  driver's validPattern()/getInterfaceConfiguration
+--  rely on) never throws on failure, it just silently
+--  returns null. That means getInterfaceConfiguration
+--  NOT throwing is the FAILURE signal (pattern has no
+--  valid output AE2 recognizes), and it throwing
+--  "Not Fluid Encoded pattern!" is actually the SUCCESS
+--  signal (AE2 found a real, matching output). This
+--  script's final check reflects that corrected
+--  understanding.
+--
+--  Also confirmed: for a crafting-type pattern (which
+--  this is, since it was primed as one), whatever we
+--  write via setInterfacePatternItemOutput is IGNORED
+--  by AE2's validation -- PatternHelper computes the
+--  real output itself from the matched recipe
+--  (standardRecipe.getCraftingResult(...)), not from
+--  our "out" NBT. We still write it (needed for the
+--  physical item to display/behave correctly), but it
+--  has no bearing on whether the pattern validates.
 -- =============================================
 
 local component = require("component")
@@ -66,7 +99,8 @@ local editor = component.oc_pattern_editor
 local db = component.database
 local SLOT = 1
 
-dbg("=== Minimal Pattern Test: 2 planks -> 4 sticks ===")
+dbg("=== Minimal Pattern Test v2: 2 planks -> 4 sticks ===")
+dbg("(fixed: 2 separate 1-plank slots, not 1 slot with count=2)")
 
 local okChk, existing = pcall(editor.getInterfacePattern, SLOT)
 if not okChk or not existing then
@@ -79,38 +113,48 @@ dbg("Clearing any existing entries first (in case of leftovers from earlier test
 for i=1,9 do pcall(editor.clearInterfacePatternInput, SLOT, i) end
 for o=1,4 do pcall(editor.clearInterfacePatternOutput, SLOT, o) end
 
-dbg("Writing input: 2x minecraft:planks:0 at index 1...")
+dbg("Writing input: 1x minecraft:planks:0 at index 1...")
 local ok1, e1 = pcall(db.set, 1, "minecraft:planks", 0)
-if not ok1 then dbg("[FAIL] db.set (input) failed: "..tostring(e1)); return end
-local ok2, e2 = pcall(editor.setInterfacePatternItemInput, SLOT, db.address, 1, 2, 1)
-if not ok2 then dbg("[FAIL] setInterfacePatternItemInput failed: "..tostring(e2)); return end
-dbg("[OK] input written.")
+if not ok1 then dbg("[FAIL] db.set (input 1) failed: "..tostring(e1)); return end
+local ok2, e2 = pcall(editor.setInterfacePatternItemInput, SLOT, db.address, 1, 1, 1)
+if not ok2 then dbg("[FAIL] setInterfacePatternItemInput (index 1) failed: "..tostring(e2)); return end
+dbg("[OK] input 1 written.")
+
+dbg("Writing input: 1x minecraft:planks:0 at index 2 (separate slot, not stacked)...")
+local ok1b, e1b = pcall(db.set, 2, "minecraft:planks", 0)
+if not ok1b then dbg("[FAIL] db.set (input 2) failed: "..tostring(e1b)); return end
+local ok2b, e2b = pcall(editor.setInterfacePatternItemInput, SLOT, db.address, 2, 1, 2)
+if not ok2b then dbg("[FAIL] setInterfacePatternItemInput (index 2) failed: "..tostring(e2b)); return end
+dbg("[OK] input 2 written.")
 
 dbg("Writing output: 4x minecraft:stick:0 at index 1...")
-local ok3, e3 = pcall(db.set, 2, "minecraft:stick", 0)
+local ok3, e3 = pcall(db.set, 3, "minecraft:stick", 0)
 if not ok3 then dbg("[FAIL] db.set (output) failed: "..tostring(e3)); return end
-local ok4, e4 = pcall(editor.setInterfacePatternItemOutput, SLOT, db.address, 2, 4, 1)
+local ok4, e4 = pcall(editor.setInterfacePatternItemOutput, SLOT, db.address, 3, 4, 1)
 if not ok4 then dbg("[FAIL] setInterfacePatternItemOutput failed: "..tostring(e4)); return end
 dbg("[OK] output written.")
 
 dbg("Verifying AE2 actually accepts this as a real recipe...")
+-- getInterfaceConfiguration -> validPattern() -> iep.getOutput(pattern) == null.
+-- getOutput() NEVER throws (getPatternForItem catches everything internally
+-- and returns null on any failure) -- so the two real outcomes are:
+--   - throws "Not Fluid Encoded pattern!" -> getOutput() returned a REAL
+--     output -> validPattern()==false -> SUCCESS, AE2 accepted the recipe.
+--   - does NOT throw at all -> getOutput() returned null -> validPattern()
+--     ==true -> FAILURE, AE2 still doesn't see a valid recipe here.
 local okCfg, cfgErr = pcall(editor.getInterfaceConfiguration, SLOT)
 if okCfg then
-  dbg("[WARN] getInterfaceConfiguration did not throw -- unexpected.")
-  dbg("       AE2's getOutput() returned nil; it thinks there's still no output set.")
+  dbg("[FAIL] getInterfaceConfiguration did NOT throw -- this means AE2's")
+  dbg("       getOutput() returned nil, i.e. it still does NOT consider this")
+  dbg("       a valid recipe. Something is still wrong with the ingredients")
+  dbg("       or this physical pattern item.")
 elseif tostring(cfgErr):find("Not Fluid Encoded pattern", 1, true) then
-  dbg("[OK] CONFIRMED: AE2 accepts this as a real, valid recipe.")
+  dbg("[OK] CONFIRMED: AE2 accepts this as a real, valid recipe!")
   dbg("     If the item still looks unchanged in-game, take it out of the")
   dbg("     editor and back in (or reopen the GUI) -- that's a render-cache")
   dbg("     issue, not a data issue, since AE2 itself just confirmed it's valid.")
 else
-  dbg("[FAIL] AE2 rejected the written pattern: "..tostring(cfgErr))
-  dbg("       Since this is the simplest possible real vanilla recipe with")
-  dbg("       hardcoded concrete IDs, a rejection here means the issue is")
-  dbg("       either this specific physical pattern item (try a totally")
-  dbg("       fresh one) or something about the OC Pattern Editor driver")
-  dbg("       itself/this GTNH build's version of it -- not our resolution")
-  dbg("       or recipe-lookup logic, which isn't involved in this test at all.")
+  dbg("[WARN] getInterfaceConfiguration threw something unexpected: "..tostring(cfgErr))
 end
 
 dbg("")
