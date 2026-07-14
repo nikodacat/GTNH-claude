@@ -28,6 +28,7 @@ local FILES = {
   "test_craft_oc",
   "test_pattern_write_oc",
   "diag_pattern_editor_oc",
+  "minimal_pattern_test_oc",
   "config.example",
   "update_oc",
 }
