@@ -67,6 +67,16 @@
 --  has zero bearing on whether the pattern validates. This
 --  version writes 2 sticks (GTNH's real ratio) instead of
 --  vanilla's 4, purely for display accuracy.
+--
+--  v4 (this version): the previous run showed [FAIL] with
+--  the corrected 2-slot arrangement AND a fresh pattern, so
+--  something deeper is going on than the two bugs already
+--  fixed. Added diagnostic checkpoints BEFORE clearing,
+--  and BEFORE writing output, and logs every individual
+--  clear call's result instead of silently discarding it --
+--  so we can see exactly which step first diverges from
+--  expected behavior, rather than guessing further from
+--  static source reading alone.
 -- =============================================
 
 local component = require("component")
@@ -125,7 +135,7 @@ local editor = component.oc_pattern_editor
 local db = component.database
 local SLOT = 1
 
-dbg("=== Minimal Pattern Test v3: 2 planks -> 2 sticks (GTNH ratio) ===")
+dbg("=== Minimal Pattern Test v4: 2 planks -> 2 sticks (GTNH ratio) ===")
 dbg("If this still fails, the pattern item itself is likely poisoned")
 dbg("from an earlier failed attempt -- try a completely FRESH one.")
 
@@ -137,9 +147,32 @@ if not okChk or not existing then
 end
 dbg("[OK] found item in slot "..SLOT..": "..tostring(existing.label or existing.name or "?"))
 
-dbg("Clearing any existing entries first (in case of leftovers from earlier tests)...")
-for i=1,9 do pcall(editor.clearInterfacePatternInput, SLOT, i) end
-for o=1,4 do pcall(editor.clearInterfacePatternOutput, SLOT, o) end
+dbg("Checking whether this pattern is editable BEFORE clearing (diagnostic)...")
+-- Log the exact outcome of getInterfaceConfiguration on the UNTOUCHED,
+-- freshly-primed pattern, before we touch anything. This tells us what
+-- validPattern() actually returns for a pattern we believe has a real,
+-- valid recipe already on it -- if it's ALREADY "did not throw" here,
+-- that's a strong signal something about getOutput()/world-context is
+-- not behaving the way the AE2 source implies it should in this exact
+-- runtime, rather than anything about our own clear/write logic.
+local okPre, errPre = pcall(editor.getInterfaceConfiguration, SLOT)
+if okPre then
+  dbg("  [PRE-CHECK] getInterfaceConfiguration did NOT throw on the untouched")
+  dbg("              pattern -- AE2 already sees no valid output here, BEFORE")
+  dbg("              we've cleared or written anything.")
+else
+  dbg("  [PRE-CHECK] getInterfaceConfiguration threw: "..tostring(errPre))
+end
+
+dbg("Clearing any existing entries (logging each result, not discarding)...")
+for i=1,9 do
+  local ok, err = pcall(editor.clearInterfacePatternInput, SLOT, i)
+  if not ok then dbg("  clearInput("..i..") failed: "..tostring(err)) end
+end
+for o=1,4 do
+  local ok, err = pcall(editor.clearInterfacePatternOutput, SLOT, o)
+  if not ok then dbg("  clearOutput("..o..") failed: "..tostring(err)) end
+end
 
 dbg("Writing input: 1x minecraft:planks:0 at index 1...")
 local ok1, e1 = pcall(db.set, 1, "minecraft:planks", 0)
@@ -154,6 +187,18 @@ if not ok1b then dbg("[FAIL] db.set (input 2) failed: "..tostring(e1b)); flushDe
 local ok2b, e2b = pcall(editor.setInterfacePatternItemInput, SLOT, db.address, 2, 1, 2)
 if not ok2b then dbg("[FAIL] setInterfacePatternItemInput (index 2) failed: "..tostring(e2b)); flushDebug("write-fail"); return end
 dbg("[OK] input 2 written.")
+
+-- mid-point diagnostic: check BEFORE writing output, so we can tell
+-- whether the recipe is already recognized from inputs alone (crafting-
+-- type patterns don't need a written output for findMatchingRecipe to
+-- succeed -- the output write is purely cosmetic per the header notes).
+local okMid, errMid = pcall(editor.getInterfaceConfiguration, SLOT)
+if okMid then
+  dbg("  [MID-CHECK] did NOT throw -- still no valid output recognized")
+  dbg("              with just the 2 planks written (before output write).")
+else
+  dbg("  [MID-CHECK] threw: "..tostring(errMid))
+end
 
 dbg("Writing output: 2x minecraft:stick:0 at index 1 (GTNH ratio, display only)...")
 local ok3, e3 = pcall(db.set, 3, "minecraft:stick", 0)
