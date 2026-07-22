@@ -213,6 +213,66 @@ def describe_item(entry):
     count = entry.get("count", 1)
     return f"{count}x {label}"
 
+def combine_id_damage(item_id, damage):
+    """'gregtech:gt.metatool.01' + 10 -> 'gregtech:gt.metatool.01:10'
+    'minecraft:stick' + 0 -> 'minecraft:stick' (bare, no ':0' suffix) --
+    matches recipe_db.json's existing convention (and split_item_id()'s
+    inverse) of only appending an explicit meta segment when it's
+    non-zero. scan_patterns_oc.lua reports `id` (bare registry name) and
+    `damage` (meta) as SEPARATE fields (mirroring ItemStack{name, damage,
+    ...}) -- they need to be recombined into one string to be usable as
+    a recipe_db.json/ingredient-style id."""
+    damage = damage or 0
+    return item_id if damage == 0 else f"{item_id}:{damage}"
+
+def build_gt_machine_recipe(machine_name, inputs, outputs):
+    """Turn one scanned pattern's raw inputs/outputs (the same shape
+    scan_patterns_oc.lua reports and known_patterns.json stores) into a
+    recipe_db.json gt_machine entry, once the interface it came from is
+    known to belong to `machine_name`.
+
+    Deliberately leaves out tier/duration_ticks/eu_per_tick -- an AE2
+    pattern only ever encodes item (and fluid) inputs/outputs, never a
+    GT recipe's tier/duration/EU, so there is no way to recover those
+    from a scan. Confirmed acceptable: build_craft_tree()/
+    get_recipe_output_count() don't read those fields today, and the one
+    piece of information that actually matters here -- which machine a
+    recipe belongs to -- is always known by the time this is called
+    (the whole point of the machine-labeling flow this depends on)."""
+    item_inputs  = [{"item": combine_id_damage(e.get("id"), e.get("damage", 0)), "count": e.get("count", 1)} for e in inputs]
+    item_outputs = [{"item": combine_id_damage(e.get("id"), e.get("damage", 0)), "count": e.get("count", 1)} for e in outputs]
+    primary_item = item_outputs[0]["item"] if item_outputs else None
+    recipe = {
+        "type": "gt_machine",
+        "item": primary_item,
+        "machine": machine_name,
+        "item_inputs": item_inputs,
+        "item_outputs": item_outputs,
+    }
+    return primary_item, recipe
+
+def save_learned_recipe(machine_name, inputs, outputs):
+    """Builds + appends one gt_machine recipe to recipe_db.json (does
+    nothing if the pattern has no output at all -- nothing to key it
+    on). Returns the recipe's primary item id, or None if it couldn't
+    be saved. Caller is responsible for any is_new/is_changed gating --
+    this always appends unconditionally when called."""
+    primary_item, recipe = build_gt_machine_recipe(machine_name, inputs, outputs)
+    if not primary_item:
+        return None
+    with recipe_db_lock:
+        recipe_db.setdefault(primary_item, []).append(recipe)
+        try:
+            save_recipe_db()
+        except Exception as e:
+            recipe_db[primary_item].remove(recipe)
+            if not recipe_db[primary_item]:
+                del recipe_db[primary_item]
+            print(f"[recipe-import][err] failed to save recipe_db.json: {e}")
+            append_log("error", f"failed to save recipe_db.json: {e}")
+            return None
+    return primary_item
+
 
 # ── item label index (id:meta -> display name) ────────────────────────
 # recipe_db.json and ore_dict.json only ever store internal item ids
@@ -1955,9 +2015,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.send_json(500, {"error": str(e)})
                 return
 
+        in_desc  = ", ".join(describe_item(e) for e in inputs)  or "(none)"
+        out_desc = ", ".join(describe_item(e) for e in outputs) or "(none)"
+
         if is_new or is_changed:
-            in_desc  = ", ".join(describe_item(e) for e in inputs)  or "(none)"
-            out_desc = ", ".join(describe_item(e) for e in outputs) or "(none)"
             verb = "New" if is_new else "Changed"
             msg = (f"{verb} pattern found on interface \"{label}\" slot {idx}:\n"
                    f"  in:  {in_desc}\n"
@@ -1965,14 +2026,30 @@ class Handler(http.server.BaseHTTPRequestHandler):
             print(f"[pattern-scan] {msg}")
             append_log("diag", msg)
 
-        # ── unidentified-machine detection ────────────────────────
-        # Independent of is_new/is_changed above (which track the pattern
-        # CONTENT, not the machine-labeling workflow) -- runs on every
-        # report, but only ever prompts once per interface (see
-        # load/save_interface_meta's comment above for why no marker
-        # pattern is needed anymore).
+        # ── unidentified-machine detection + recipe learning ──────
+        # Independent of is_new/is_changed's diag message above -- these
+        # two features share the same underlying scan report but track
+        # different things (pattern CONTENT vs. the machine-labeling/
+        # recipe-learning workflow). Runs on every report:
+        #   - interface never seen before at all -> record it (machine
+        #     unset) and prompt, ONCE, asking what machine this is --
+        #     see load/save_interface_meta's comment above for why no
+        #     marker pattern is needed to trigger this anymore. Every
+        #     pattern already scanned or later scanned on this interface
+        #     is picked up retroactively once it's finally labeled (see
+        #     handle_label_machine below) -- nothing here needs to stage
+        #     it separately, known_patterns.json already has it.
+        #   - interface already recorded but still unlabeled -> do
+        #     nothing further (already asked, don't spam).
+        #   - interface already labeled -> treat this exact interface as
+        #     "the whole interface is a usable pattern holder for this
+        #     machine" (the user's own design decision) -- any genuinely
+        #     new/changed pattern on it is learned immediately as a new
+        #     gt_machine recipe for that machine, no extra confirmation
+        #     needed (the machine identity was already confirmed once).
         with interface_meta_lock:
-            if addr not in interface_meta:
+            entry = interface_meta.get(addr)
+            if entry is None:
                 interface_meta[addr] = {
                     "interface_address": addr,
                     "interface_label": label,
@@ -1987,17 +2064,30 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     print(f"[machine-label][err] failed to save interface_meta.json: {e}")
                     append_log("error", f"failed to save interface_meta.json: {e}")
                     should_prompt = False
+                machine_name = None
             else:
                 should_prompt = False  # already recorded (labeled or already prompted) -- don't spam
+                machine_name = entry.get("machine")
+
         if should_prompt:
-            # The raw address MUST appear here, not just the friendly
-            # label -- this is the only place Claude ever sees it, and
-            # tools/label_machine.py needs the exact address (matching
-            # interface_meta.json's key), not a shortened display name.
-            prompt_msg = (f"Found an unidentified machine -- interface \"{label}\" "
-                          f"(address {addr}). What machine is this?")
+            # The raw address AND what's actually in the pattern both
+            # need to be in this message -- the address is the only place
+            # Claude ever sees it (tools/label_machine.py needs the exact
+            # address, not a shortened display name), and the ingredient/
+            # output description is what lets the PLAYER actually
+            # recognize which physical adapter is being asked about,
+            # rather than a meaningless address string (explicit feedback
+            # from the user on the first version of this prompt).
+            prompt_msg = (f"Found an unidentified machine -- interface \"{label}\" (address {addr}). "
+                          f"Its pattern: in: {in_desc} -> out: {out_desc}. Which machine is this for?")
             print(f"[machine-label] {prompt_msg}")
             append_log("claude", prompt_msg)
+        elif machine_name and (is_new or is_changed):
+            learned_item = save_learned_recipe(machine_name, inputs, outputs)
+            if learned_item:
+                learn_msg = f"Learned a new recipe for {machine_name}: in: {in_desc} -> out: {out_desc}"
+                print(f"[recipe-import] {learn_msg}")
+                append_log("claude", learn_msg)
 
         self.send_json(200, {"status": "ok", "new": is_new, "changed": is_changed})
 
@@ -2005,11 +2095,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def handle_label_machine(self):
         """Called by tools/label_machine.py, which Claude invokes when the
         player answers a "what machine is this?" prompt in chat. Requires
-        the interface to already be on record (i.e. a stick-marker scan
-        must have reported it first) -- this only fills in the `machine`
-        field, it doesn't create a brand new interface entry from
-        scratch, since we'd have no interface_label/marker_pattern_index
-        to store without a real scan having happened."""
+        the interface to already be on record (i.e. scan_patterns_oc.lua
+        must have reported at least one pattern on it first) -- this only
+        fills in the `machine` field, it doesn't create a brand new
+        interface entry from scratch, since we'd have no interface_label
+        to store without a real scan having happened.
+
+        Also retroactively converts every pattern known_patterns.json has
+        ever recorded for this interface (there can be more than one, if
+        several slots got scanned before the player ever answered this
+        prompt) into gt_machine recipe_db.json entries tagged with the
+        now-known machine name -- any pattern scanned AFTER this point is
+        instead picked up live, in handle_report_pattern's "already
+        labeled" branch above."""
         data, err = self._read_json_body()
         if err:
             self.send_json(400, {"error": err})
@@ -2025,7 +2123,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             entry = interface_meta.get(addr)
             if not entry:
                 self.send_json(404, {
-                    "error": "unknown interface_address -- it needs to show up in a stick-marker "
+                    "error": "unknown interface_address -- it needs to show up in a pattern "
                               "scan (scan_patterns_oc.lua) before it can be labeled",
                 })
                 return
@@ -2042,7 +2140,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
         label = entry.get("interface_label") or addr[:8]
         print(f"[machine-label] interface \"{label}\" labeled as: {machine}")
         append_log("claude", f"Got it -- interface \"{label}\" is now labeled as: {machine}")
-        self.send_json(200, {"status": "ok", "interface_address": addr, "machine": machine})
+
+        # retroactively learn every pattern already scanned on this
+        # interface while it was still unlabeled
+        with known_patterns_lock:
+            prior_patterns = [p for k, p in known_patterns.items() if k.startswith(f"{addr}#")]
+        learned_items = []
+        for p in prior_patterns:
+            learned_item = save_learned_recipe(machine, p.get("inputs", []), p.get("outputs", []))
+            if learned_item:
+                learned_items.append(learned_item)
+        if learned_items:
+            items_desc = ", ".join(learned_items)
+            print(f"[recipe-import] learned {len(learned_items)} recipe(s) for {machine}: {items_desc}")
+            append_log("claude", f"Also learned {len(learned_items)} recipe(s) already on that interface for {machine}: {items_desc}")
+
+        self.send_json(200, {"status": "ok", "interface_address": addr, "machine": machine, "learned_recipes": learned_items})
 
     # ── item label scan endpoint ─────────────────────────────────
     def handle_report_labels(self):
