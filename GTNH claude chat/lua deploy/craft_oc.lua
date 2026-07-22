@@ -11,6 +11,7 @@ local computer  = require("computer")
 local term      = require("term")
 local io        = require("io")
 local os        = require("os")
+local event     = require("event")
 
 -- ── local config (NOT tracked in git) ─────────
 -- Copy config.example.lua to DISK.."/config.lua" and set your
@@ -318,6 +319,149 @@ local function getCraftables()
   return list
 end
 
+-- ── background craft-job polling ──────────────
+-- Claude can queue a craft job (via tools/request_craft.py -> POST
+-- /request_craft) from EITHER the web chat or this terminal -- so this
+-- can't just be checked when someone happens to be typing here. Instead
+-- of rewriting the existing io.read()-based chat loop (proven working
+-- after this project's earlier truncation/io.read() debugging saga --
+-- not touching it is deliberate), this uses OpenOS's own event.timer(),
+-- which fires a callback on a schedule independent of the main loop, as
+-- long as the script keeps yielding to the event system somewhere --
+-- which io.read() (and every net.request() wait-loop in this file)
+-- already does constantly. No change to the chat loop itself is needed.
+local JOB_POLL_INTERVAL = 10  -- seconds between queue checks
+local activeCraftJobs = {}    -- jobId -> {craftJob=<AECraftingJob>, item=.., qty=.., cpuName=..}
+
+-- Checks every craft job we've already submitted this session for
+-- completion/failure and reports back exactly once each way -- cheap,
+-- no blocking waits, just a non-blocking status check per job per tick.
+local function pollActiveCraftJobs()
+  for jobId, info in pairs(activeCraftJobs) do
+    local okFail, hasFailed     = pcall(info.craftJob.hasFailed)
+    local okCancel, isCanceled  = pcall(info.craftJob.isCanceled)
+    local okDone, isDone        = pcall(info.craftJob.isDone)
+    if (okFail and hasFailed) or (okCancel and isCanceled) then
+      dbg("job "..jobId.." failed/canceled")
+      post("/report_job_result", {job_id=jobId, success=false,
+        details="AE2 reported the craft as failed or canceled."})
+      cprint(0xFF4444, "\n[job] "..info.qty.."x "..info.item.." FAILED (AE2 reported failed/canceled).")
+      activeCraftJobs[jobId] = nil
+    elseif okDone and isDone then
+      dbg("job "..jobId.." finished")
+      post("/report_job_result", {job_id=jobId, success=true,
+        details="Craft completed on CPU '"..info.cpuName.."'."})
+      cprint(0x00FF00, "\n[job] "..info.qty.."x "..info.item.." completed.")
+      activeCraftJobs[jobId] = nil
+    end
+    -- else: still computing -- leave it, check again next tick
+  end
+end
+
+-- Asks the server for the oldest still-queued job (if any) and, if AE2
+-- has a free crafting CPU right now, submits it. The CPU check happens
+-- HERE -- immediately before submitting -- not when Claude originally
+-- queued the job, since availability can change in between (this was an
+-- explicit design requirement: check right before executing).
+local function claimAndStartOneJob()
+  local raw, err = get("/next_job")
+  if not raw then
+    dbg("job-poll: /next_job failed: "..(err or "?"))
+    return
+  end
+  if raw:find('"job"%s*:%s*null') then
+    return  -- nothing queued right now
+  end
+
+  local jobId   = extractStr(raw, "id")
+  local jobItem = extractStr(raw, "item")
+  local jobQty  = extractNum(raw, "qty")
+  if not jobId or not jobItem or not jobQty then
+    dbg("job-poll: malformed job response: "..raw:sub(1,200))
+    return
+  end
+
+  cprint(0x00FFFF, "\n[job] Picked up craft job: "..jobQty.."x "..jobItem.." (job "..jobId..")")
+  dbg("job-poll: claimed "..jobId..": "..jobQty.."x "..jobItem)
+
+  local okCpus, cpus = pcall(me.getCpus)
+  if not okCpus or not cpus then
+    dbg("job-poll: getCpus failed: "..tostring(cpus))
+    post("/report_job_result", {job_id=jobId, success=false,
+      details="could not query AE2 CPUs: "..tostring(cpus)})
+    cprint(0xFF4444, "[job] FAILED -- couldn't query AE2 CPUs.")
+    return
+  end
+
+  local freeCpu = nil
+  for _, c in ipairs(cpus) do
+    if not c.busy then freeCpu = c; break end
+  end
+  if not freeCpu then
+    dbg("job-poll: no free CPU ("..#cpus.." total, all busy)")
+    post("/report_job_result", {job_id=jobId, success=false,
+      details="no free AE2 crafting CPU right now ("..#cpus.." total, all busy) -- try again later"})
+    cprint(0xFFAA00, "[job] No free AE2 CPU right now -- will need to be requested again later.")
+    return
+  end
+
+  local okCraftables, craftables = pcall(me.getCraftables)
+  if not okCraftables or not craftables then
+    dbg("job-poll: getCraftables failed: "..tostring(craftables))
+    post("/report_job_result", {job_id=jobId, success=false,
+      details="could not query AE2 craftables: "..tostring(craftables)})
+    cprint(0xFF4444, "[job] FAILED -- couldn't query AE2 craftables.")
+    return
+  end
+
+  -- NOTE: this file's existing getCraftables() (above) reads `.name`
+  -- directly off each craftable, but the official AECraftable API docs
+  -- only document `.getItemStack()` (which returns a stack with `.name`)
+  -- -- not a bare `.name` field. Unclear which is actually right for
+  -- this GTNH version without a real in-game check, so this tries both:
+  -- direct `.name` first (matching the existing convention elsewhere in
+  -- this file), falling back to `.getItemStack().name` if that's absent.
+  local target = nil
+  for _, c in ipairs(craftables) do
+    local candidateName = c.name
+    if not candidateName then
+      local okStack, stack = pcall(c.getItemStack)
+      if okStack and stack then candidateName = stack.name end
+    end
+    if candidateName == jobItem then
+      target = c
+      break
+    end
+  end
+  if not target then
+    dbg("job-poll: no craftable pattern found for "..jobItem)
+    post("/report_job_result", {job_id=jobId, success=false,
+      details="no AE2 craftable pattern found for "..jobItem.." -- is a pattern encoded for it?"})
+    cprint(0xFF4444, "[job] FAILED -- no craftable pattern found for "..jobItem..".")
+    return
+  end
+
+  local okReq, craftJob = pcall(target.request, jobQty, false, freeCpu.name)
+  if not okReq or not craftJob then
+    dbg("job-poll: request() failed: "..tostring(craftJob))
+    post("/report_job_result", {job_id=jobId, success=false,
+      details="AE2 request() call failed: "..tostring(craftJob)})
+    cprint(0xFF4444, "[job] FAILED -- AE2 request() call errored.")
+    return
+  end
+
+  activeCraftJobs[jobId] = {craftJob=craftJob, item=jobItem, qty=jobQty, cpuName=freeCpu.name}
+  dbg("job-poll: "..jobId.." submitted on cpu "..freeCpu.name)
+  cprint(0x888888, "[job] Submitted on CPU '"..freeCpu.name.."' -- will report back once it finishes.")
+end
+
+local function jobPollTick()
+  local ok1, e1 = pcall(pollActiveCraftJobs)
+  if not ok1 then dbg("pollActiveCraftJobs errored: "..tostring(e1)) end
+  local ok2, e2 = pcall(claimAndStartOneJob)
+  if not ok2 then dbg("claimAndStartOneJob errored: "..tostring(e2)) end
+end
+
 local ALWAYS={"plank","stick","stone","iron_ingot","gold_ingot",
   "copper","tin","redstone","diamond","coal","glass","rubber","steel"}
 
@@ -479,6 +623,14 @@ while true do
 end
 dbg("Drained "..drained.." stray signal(s)")
 dbg("term.keyboard() right before loop: "..tostring(term.keyboard and term.keyboard() or "term.keyboard n/a"))
+
+-- Background job polling starts here -- fires roughly every
+-- JOB_POLL_INTERVAL seconds for as long as this script runs, independent
+-- of whether anyone is typing (a queued job can come from the web chat
+-- with nobody at this terminal at all). Does NOT touch or replace the
+-- io.read()-based loop below.
+event.timer(JOB_POLL_INTERVAL, jobPollTick, math.huge)
+dbg("job-poll timer registered, interval="..JOB_POLL_INTERVAL.."s")
 
 flushDebug("init-complete")
 
