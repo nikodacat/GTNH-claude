@@ -188,7 +188,7 @@ local function encodeReport(addr, label, patternIndex, inputs, outputs)
     encodeItemsArray(inputs), encodeItemsArray(outputs))
 end
 
--- ── HTTP POST helper (connect, wait, read whole response) ──
+-- ── HTTP helpers (connect, wait, read whole response) ──
 local function postJson(path, bodyStr)
   local req, err = net.request(SERVER..path, bodyStr, {["Content-Type"]="application/json"})
   if not req then return nil, err end
@@ -207,6 +207,37 @@ local function postJson(path, bodyStr)
   end
   req.close()
   return r, nil
+end
+
+-- plain GET, same connect/read shape as postJson but no request body --
+-- needed for polling /next_scan (this file never needed a GET before,
+-- since scanning used to be purely fire-and-forget POST reports)
+local function getJson(path)
+  local req, err = net.request(SERVER..path)
+  if not req then return nil, err end
+  local dl = computer.uptime()+15
+  while computer.uptime()<dl do
+    local ok, e2 = req.finishConnect()
+    if ok then break end
+    if ok==nil then req.close(); return nil, e2 end
+    os.sleep(0.05)
+  end
+  local r=""
+  while true do
+    local chunk=req.read(8192)
+    if not chunk then break end
+    r=r..chunk
+  end
+  req.close()
+  return r, nil
+end
+
+-- minimal JSON field extractor -- mirrors craft_oc.lua's extractStr, kept
+-- as its own copy here since these are separate standalone scripts
+local function extractStr(raw, key)
+  local p = raw:match('"'..key..'":%s*"(.-[^\\])"')
+  if p then return p:gsub('\\"','"'):gsub('\\n','\n'):gsub('\\\\','\\') end
+  return nil
 end
 
 -- ── hardware checks ─────────────────────────────
@@ -370,11 +401,65 @@ local function scanInterface(addr)
   end
 end
 
--- ── main ─────────────────────────────────────────
-dbg("=== ME Interface Pattern Scan ===")
-for _, addr in ipairs(interfaces) do
-  scanInterface(addr)
+-- ── scan-request background poll ─────────────────
+-- This computer's sole job is scanning -- chat/crafting live entirely on
+-- the other OC computer (craft_oc.lua, see that file's "chat moved out of
+-- OC" history), so there's no interactive command loop to preserve here
+-- (unlike craft_oc.lua's job-poll timer, which had to piggyback on an
+-- existing io.read() loop without rewriting it -- no such constraint on
+-- this computer, so a plain infinite loop is simplest).
+--
+-- Polls a SEPARATE queue from craft_oc.lua's crafting job queue (user's
+-- explicit call: a scan request and a craft job are different shapes of
+-- thing) -- Claude queues one via tools/request_scan.py -> POST
+-- /request_scan, this polls GET /next_scan for one, and reports back via
+-- POST /report_scan_result once done.
+local SCAN_POLL_INTERVAL = 10  -- seconds between checking for a scan request
+
+local function runFullScan()
+  dbg("=== ME Interface Pattern Scan ===")
+  for _, addr in ipairs(interfaces) do
+    scanInterface(addr)
+  end
+  dbg("=== Scan complete ===")
 end
-dbg("=== Scan complete ===")
-flushDebug("scan-complete")
-io.read()
+
+local function checkForScanRequest()
+  local raw, err = getJson("/next_scan")
+  if not raw then
+    dbg("scan-poll: /next_scan failed: "..(err or "?"))
+    return
+  end
+  if raw:find('"scan"%s*:%s*null') then
+    return  -- nothing queued right now
+  end
+
+  local scanId = extractStr(raw, "id")
+  if not scanId then
+    dbg("scan-poll: malformed /next_scan response: "..raw:sub(1,200))
+    return
+  end
+
+  dbg("scan-poll: claimed scan request "..scanId)
+  runFullScan()
+  flushDebug("scan-complete")
+
+  local resp, perr = postJson("/report_scan_result",
+    '{"scan_id":'..jsonStr(scanId)..',"success":true,"details":"scan complete"}')
+  if not resp then
+    dbg("scan-poll: report_scan_result failed: "..tostring(perr))
+    flushDebug("report-fail")
+  end
+end
+
+-- ── main ─────────────────────────────────────────
+dbg("[OK] scan_patterns_oc ready -- polling every "..SCAN_POLL_INTERVAL.."s for scan requests.")
+flushDebug("ready")
+while true do
+  local ok, tickErr = pcall(checkForScanRequest)
+  if not ok then
+    dbg("scan-poll tick errored: "..tostring(tickErr))
+    flushDebug("tick-error")
+  end
+  os.sleep(SCAN_POLL_INTERVAL)
+end
