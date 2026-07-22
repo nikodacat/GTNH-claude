@@ -17,24 +17,82 @@ local DISK      = "/mnt/dc6"
 local HOME      = "/home"
 local REPO_RAW  = "https://raw.githubusercontent.com/nikodacat/GTNH-claude/main/GTNH%20claude%20chat/lua%20deploy/"
 
--- files to pull -- add new ones here as the project grows.
--- Just the base name, no ".lua" -- it's appended below.
--- config is deliberately NOT in this list (config.lua stays local-only).
-local FILES = {
-  "craft_oc",
-  "claude_chat_oc",
-  "diag_oc",
-  "lookup_item_name_oc",
-  "test_craft_oc",
-  "test_pattern_write_oc",
-  "test_pattern_write_direct_oc",
-  "diag_pattern_editor_oc",
-  "minimal_pattern_test_oc",
-  "scan_patterns_oc",
+-- files to pull -- add new ones here as the project grows. Just the base
+-- name, no ".lua" -- it's appended below. config is deliberately NOT in
+-- either list below (config.lua stays local-only).
+--
+-- Split by ROLE (see init_oc.lua): every computer fetches COMMON_FILES
+-- regardless of role, plus whichever ROLE_FILES[role] entry matches
+-- role.lua's saved choice on THIS disk. This exists so a lean,
+-- purpose-built second computer (e.g. the pattern-scanning one) doesn't
+-- end up with every test/debug script from this project's history
+-- cluttering its disk -- it only needs scan_patterns_oc, nothing else.
+--
+-- Backward-compat / safety net: if role.lua doesn't exist yet (a
+-- computer that predates this system, or init_oc hasn't been run on it
+-- yet), this falls back to fetching EVERY file across every role --
+-- exactly the old, pre-role behavior -- so nothing breaks on an
+-- already-set-up computer just because it hasn't opted into a role yet.
+local COMMON_FILES = {
   "after_update_oc",
   "config.example",
   "update_oc",
+  "init_oc",
+  "diag_oc",       -- generic hardware diagnostic, useful on any computer
 }
+local ROLE_FILES = {
+  craft = {
+    "craft_oc",
+    "claude_chat_oc",
+    "lookup_item_name_oc",
+    "test_craft_oc",
+    "test_pattern_write_oc",
+    "test_pattern_write_direct_oc",
+    "diag_pattern_editor_oc",
+    "minimal_pattern_test_oc",
+  },
+  scan = {
+    "scan_patterns_oc",
+  },
+}
+
+local function readRole()
+  local f = io.open(DISK.."/role.lua", "r")
+  if not f then return nil end
+  f:close()
+  local ok, cfg = pcall(dofile, DISK.."/role.lua")
+  if ok and type(cfg) == "table" and cfg.ROLE then return cfg.ROLE end
+  return nil
+end
+
+local function everyFile()
+  local all = {}
+  for _, f in ipairs(COMMON_FILES) do all[#all+1] = f end
+  for _, files in pairs(ROLE_FILES) do
+    for _, f in ipairs(files) do all[#all+1] = f end
+  end
+  return all
+end
+
+-- Returns (fileList, roleNameOrNil, warningMessageOrNil):
+--   - a known role in role.lua -> (that role's files, role name, nil)
+--   - no role.lua at all        -> (everything, nil, nil)              [normal, not a warning]
+--   - role.lua names an unknown role -> (everything, nil, warning text) [worth telling the player]
+local function buildFileList()
+  local role = readRole()
+  if not role then
+    return everyFile(), nil, nil
+  end
+  if not ROLE_FILES[role] then
+    return everyFile(), nil, "unknown role \""..role.."\" in role.lua -- fetched everything instead"
+  end
+  local list = {}
+  for _, f in ipairs(COMMON_FILES) do list[#list+1] = f end
+  for _, f in ipairs(ROLE_FILES[role]) do list[#list+1] = f end
+  return list, role, nil
+end
+
+local FILES, ACTIVE_ROLE, ROLE_WARNING = buildFileList()
 
 -- ── after-update hooks ─────────────────────────
 -- Base names (must also appear in FILES above, so they get fetched to
@@ -172,6 +230,13 @@ end
 
 dbg("=== Updating scripts from GitHub ===")
 dbg("Source: " .. REPO_RAW)
+if ACTIVE_ROLE then
+  dbg("Role: " .. ACTIVE_ROLE .. " (" .. #FILES .. " file(s) -- run init_oc to change)")
+elseif ROLE_WARNING then
+  dbg("[!] " .. ROLE_WARNING)
+else
+  dbg("No role.lua found -- fetching every file (run init_oc once to switch to a lean, role-based file set)")
+end
 dbg("")
 
 local okCount, failCount = 0, 0
