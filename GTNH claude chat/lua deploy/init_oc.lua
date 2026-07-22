@@ -27,7 +27,7 @@ local computer  = require("computer")
 local io        = require("io")
 local os        = require("os")
 
-local DISK      = "/mnt/dc6"
+local DISK      = "/home"   -- was /mnt/dc6 (secondary disk mount) -- moved to /home since disk mount labels change when the physical disk is swapped (2026-07-23, T3 disk upgrade); DISK and HOME are now the same path, kept as two names since other scripts still distinguish them
 local HOME      = "/home"
 local ROLE_FILE = DISK.."/role.lua"
 local REPO_RAW  = "https://raw.githubusercontent.com/nikodacat/GTNH-claude/main/GTNH%20claude%20chat/lua%20deploy/"
@@ -157,9 +157,9 @@ end
 -- ── auto-start on boot: write /home/.shrc ──────
 -- OpenOS sources /home/.shrc from /etc/profile.lua every time a shell
 -- loads (normally once at boot) -- each line runs as if typed at the
--- prompt. Absolute paths, not bare names, since DISK ("/mnt/dc6") isn't
--- necessarily on the shell's PATH -- this way it doesn't matter either
--- way. Written regardless of whether TODAY's update_oc run above
+-- prompt. Absolute paths, not bare names, since DISK isn't necessarily on
+-- the shell's PATH -- this way it doesn't matter either way. Written
+-- regardless of whether TODAY's update_oc run above
 -- succeeded -- this is about every FUTURE boot, not just this run, and a
 -- transient network hiccup right now shouldn't stop boot-autostart from
 -- being set up for later.
