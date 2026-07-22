@@ -53,12 +53,16 @@
 --  many "grid"/"ingredients" entries are OreDictionary
 --  tags (e.g. "ore:dustRedstone"), not concrete item
 --  IDs. AE2 patterns need a CONCRETE item+damage, so
---  this script resolves ore: tags by searching your
---  live ME network for a matching item and picking the
---  one you have the most of. It prints a NOTE line for
---  every ore: resolution so you can sanity-check it --
---  if it picks the wrong variant, the craft will still
---  request that exact item, not a substitute.
+--  this script resolves ore: tags via the server's
+--  /oredict endpoint -- an authoritative table built
+--  from a real /mt oredicts dump (ore_dict.json), not a
+--  fuzzy label search. Among the tag's real candidate
+--  items, it picks whichever one you currently have the
+--  most of in your ME network (falling back to the
+--  table's first candidate if you have none in stock).
+--  It prints a NOTE line for every ore: resolution so you
+--  can sanity-check it -- the craft will request exactly
+--  the item printed there.
 -- =============================================
 
 local component = require("component")
@@ -242,33 +246,62 @@ local function splitItemId(s)
   return s, 0
 end
 
--- ── resolve an ore:xxx tag to a concrete item by searching your ME network ──
+-- ── resolve an ore:xxx tag to a concrete item via the authoritative
+-- ore_dict.json table on the server (built from a real /mt oredicts dump),
+-- instead of fuzzy-matching item labels/names in the live ME network. The
+-- old word-matching approach could pick a same-word-but-wrong item (e.g.
+-- "dust" matching any item whose label happens to contain "dust", not
+-- necessarily a real member of the ore:xxx tag). The candidate SET now
+-- comes from the real OreDictionary registration; the live network is only
+-- consulted afterward, to break ties among the (already-correct)
+-- candidates by picking whichever one you actually have the most of.
 local function resolveOreTag(tag)
-  local keyword = tag:gsub("^ore:","")
-  -- split camelCase-ish tag into lowercase search words, e.g. dustRedstone -> dust, redstone
-  local words={}
-  for w in keyword:gmatch("%u?%l+") do words[#words+1]=w:lower() end
-  if #words==0 then words={keyword:lower()} end
+  local encoded = tag:gsub(":", "%%3A")
+  local raw, err = get("/oredict?tag="..encoded)
+  if not raw then return nil, "oredict lookup failed: "..tostring(err) end
+  if not raw:find('"found":%s*true') then
+    return nil, "no oredict entries for "..tag.." (tag not in ore_dict.json)"
+  end
 
+  local entries = extractArr(raw, "entries")
+  if not entries or #entries == 0 then
+    return nil, "oredict lookup returned no entries for "..tag
+  end
+
+  -- index live network stock by "id:damage" for quick lookup per candidate
   local ok, items = pcall(me.getItemsInNetwork, {})
-  if not ok or not items then return nil, "getItemsInNetwork failed" end
-
-  local best, bestScore, bestSize = nil, 0, 0
-  for _, it in ipairs(items) do
-    local label=(it.label or ""):lower()
-    local name =(it.name  or ""):lower()
-    local score=0
-    for _,w in ipairs(words) do
-      if label:find(w,1,true) or name:find(w,1,true) then score=score+1 end
-    end
-    if score>0 and (score>bestScore or (score==bestScore and (it.size or 0)>bestSize)) then
-      best=it; bestScore=score; bestSize=it.size or 0
+  local stockByKey = {}
+  if ok and items then
+    for _, it in ipairs(items) do
+      stockByKey[(it.name or "")..":"..tostring(it.damage or 0)] = it
     end
   end
-  if not best then return nil, "no match in network for "..tag end
-  dbg(string.format("  [NOTE] resolved %s -> %s (damage=%d, label=%s, you have %d)",
-    tag, best.name, best.damage or 0, best.label or "?", best.size or 0))
-  return best.name, best.damage or 0
+
+  -- pick the candidate you have the most of; if you have none of any
+  -- candidate in stock, fall back to the first one in the table (still a
+  -- real, correct member of the tag -- just nothing to prefer among them)
+  local bestId, bestDmg, bestStock, bestSize = nil, nil, nil, -1
+  for _, e in ipairs(entries) do
+    -- e is "modid:name:meta" or "modid:name:*" (wildcard -> treated as
+    -- damage 0 here, since a single AE2 pattern slot needs one concrete
+    -- damage value -- splitItemId's tonumber("*") is nil, defaulting to 0)
+    local id, dmg = splitItemId(e)
+    local stocked = stockByKey[id..":"..tostring(dmg)]
+    local size = stocked and (stocked.size or 0) or 0
+    if size > bestSize then
+      bestId, bestDmg, bestStock, bestSize = id, dmg, stocked, size
+    end
+  end
+
+  if not bestId then return nil, "no candidates resolved for "..tag end
+  if bestSize > 0 then
+    dbg(string.format("  [NOTE] resolved %s -> %s:%d (from ore_dict.json, label=%s, you have %d)",
+      tag, bestId, bestDmg, (bestStock and bestStock.label) or "?", bestSize))
+  else
+    dbg(string.format("  [NOTE] resolved %s -> %s:%d (from ore_dict.json, none currently in stock -- using first candidate)",
+      tag, bestId, bestDmg))
+  end
+  return bestId, bestDmg
 end
 
 local function resolveEntry(entry)
