@@ -355,12 +355,30 @@ local function scanInterface(addr)
       dbg(string.format("  interface %s pattern[%d]: %d input slot(s), %d output slot(s)",
         label, patternIndex, #rawInputs, #rawOutputs))
 
+      -- MEPatternSlot (what rawInputs[k]/rawOutputs[k] each are, from
+      -- getInterfacePattern) has a real `.count` field -- "the amount
+      -- set in the slot" -- confirmed against GTNH-OCLuaDocumentation's
+      -- MEPatternSlot.lua type def. storeSlot()'s own `count` (sourced
+      -- from db.get()'s `.size` on the SCRATCH DB readback) is NOT that:
+      -- a Database Upgrade slot is an item-identity filter/descriptor,
+      -- not a real stack, and its size reads back 0 for every entry --
+      -- that's why every ingredient was showing up as "0x" regardless
+      -- of the pattern's real amount. Use the pattern slot's own
+      -- .count as the real quantity; only fall back to storeSlot's
+      -- value (then 1) if it's missing for some reason.
       local inputs, outputs = {}, {}
       for k = 1, #rawInputs do
-        local expected = rawInputs[k] and rawInputs[k].name
+        local slotData = rawInputs[k]
+        local expected = slotData and slotData.name
         local item = storeSlot(proxy.storeInterfacePatternInput, patternIndex, k, expected)
         if item then
           item.index = k
+          local realCount = slotData and slotData.count
+          if realCount and realCount > 0 then
+            item.count = realCount
+          elseif not (item.count and item.count > 0) then
+            item.count = 1
+          end
           inputs[#inputs+1] = item
         else
           dbg("    [WARN] could not read back input slot "..k.." (tried both index conventions"
@@ -368,10 +386,17 @@ local function scanInterface(addr)
         end
       end
       for k = 1, #rawOutputs do
-        local expected = rawOutputs[k] and rawOutputs[k].name
+        local slotData = rawOutputs[k]
+        local expected = slotData and slotData.name
         local item = storeSlot(proxy.storeInterfacePatternOutput, patternIndex, k, expected)
         if item then
           item.index = k
+          local realCount = slotData and slotData.count
+          if realCount and realCount > 0 then
+            item.count = realCount
+          elseif not (item.count and item.count > 0) then
+            item.count = 1
+          end
           outputs[#outputs+1] = item
         else
           dbg("    [WARN] could not read back output slot "..k.." (tried both index conventions"
