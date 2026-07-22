@@ -4,7 +4,7 @@
 --  with debug logging to terminal + web viewer.
 -- =============================================
 
-local DISK   = "/mnt/dc6"   -- where scripts + config live
+local DISK   = "/home"   -- where scripts + config live (was /mnt/dc6 -- moved to /home, stable across disk swaps)
 
 local component = require("component")
 local computer  = require("computer")
