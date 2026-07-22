@@ -337,6 +337,12 @@ def find_items_by_label(query, limit=10):
 PENDING_JOBS_PATH = "pending_jobs.json"
 pending_jobs = {}   # job_id -> {id, item, qty, leaves, steps, status, requested_at, result}
 pending_jobs_lock = threading.Lock()
+# a job stuck on "no free CPU" is retried (see handle_report_job_result) on
+# every ~10s OC poll rather than dying on the first busy tick -- capped here
+# so a permanently-stuck job (all CPUs perpetually busy with other work)
+# eventually surfaces as a real failure instead of retrying forever. 30
+# retries * ~10s/poll ~= 5 minutes before giving up.
+MAX_JOB_RETRIES = 30
 
 def load_pending_jobs():
     global pending_jobs
@@ -2276,33 +2282,69 @@ class Handler(http.server.BaseHTTPRequestHandler):
         (e.g. which CPU was used, or why it couldn't run). Pushes a
         player-visible chat log entry either way, since the original
         request could have come from the web chat with nobody at the OC
-        terminal to see it happen live."""
+        terminal to see it happen live.
+
+        A failure can optionally be marked "retryable" (currently only the
+        no-free-CPU case in craft_oc.lua does this) -- instead of dying as
+        "failed" on the first busy tick, the job goes back to "queued" so
+        the next ~10s poll tries it again automatically. Capped at
+        MAX_JOB_RETRIES so a permanently-stuck job (e.g. every CPU
+        perpetually busy with other work) eventually surfaces as a real
+        failure instead of silently retrying forever -- and only logs a
+        chat message on the FIRST time it's blocked and when it finally
+        gives up, not on every intermediate retry tick (would spam the log
+        every 10s otherwise)."""
         data, err = self._read_json_body()
         if err:
             self.send_json(400, {"error": err})
             return
 
-        job_id  = data.get("job_id")
-        success = bool(data.get("success", False))
-        details = data.get("details", "")
+        job_id    = data.get("job_id")
+        success   = bool(data.get("success", False))
+        retryable = bool(data.get("retryable", False))
+        details   = data.get("details", "")
 
         with pending_jobs_lock:
             job = pending_jobs.get(job_id)
             if not job:
                 self.send_json(404, {"error": "unknown job_id"})
                 return
-            job["status"] = "done" if success else "failed"
-            job["result"] = details
+
+            if success:
+                job["status"] = "done"
+                job["result"] = details
+                verb = "completed"
+                should_log = True
+            elif retryable:
+                retries = job.get("retry_count", 0) + 1
+                job["retry_count"] = retries
+                if retries > MAX_JOB_RETRIES:
+                    job["status"] = "failed"
+                    job["result"] = f"gave up after {retries} attempts: {details}"
+                    verb = "FAILED"
+                    should_log = True
+                else:
+                    job["status"] = "queued"  # picked up again on the next poll
+                    job["result"] = details
+                    verb = "waiting"
+                    should_log = not job.get("cpu_wait_notified")
+                    job["cpu_wait_notified"] = True
+            else:
+                job["status"] = "failed"
+                job["result"] = details
+                verb = "FAILED"
+                should_log = True
+
             try:
                 save_pending_jobs()
             except Exception as e:
                 print(f"[craft-job][err] failed to save pending_jobs.json: {e}")
                 append_log("error", f"failed to save pending_jobs.json: {e}")
 
-        verb = "completed" if success else "FAILED"
-        msg = f"Craft job {job_id} ({job['qty']}x {job['item']}) {verb}: {details}"
-        print(f"[craft-job] {msg}")
-        append_log("claude", msg)
+        if should_log:
+            msg = f"Craft job {job_id} ({job['qty']}x {job['item']}) {verb}: {details}"
+            print(f"[craft-job] {msg}")
+            append_log("claude", msg)
         self.send_json(200, {"status": "ok"})
 
 # ── main ──────────────────────────────────────────────────────
