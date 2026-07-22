@@ -742,7 +742,7 @@ def ask_claude_vision(image_abs_path):
               + image_abs_path)
     try:
         result = subprocess.run(
-            [CLAUDE_PATH, "-p", prompt, "--permission-mode", "dontAsk", "--allowedTools", "Read"],
+            [CLAUDE_PATH, "-p", prompt, "--permission-mode", "bypassPermissions", "--allowedTools", "Read"],
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -867,7 +867,7 @@ def ask_claude(messages, system=None):
     start = time.monotonic()
     try:
         result = subprocess.run(
-            [CLAUDE_PATH, "-p", prompt, "--permission-mode", "dontAsk", "--allowedTools"] + allowed_tools,
+            [CLAUDE_PATH, "-p", prompt, "--permission-mode", "bypassPermissions", "--allowedTools"] + allowed_tools,
             capture_output=True,
             text=True,
             encoding="utf-8",
