@@ -458,7 +458,7 @@ Otherwise note that GTNH recipes may differ from vanilla.
 
 term.clear(); term.setCursor(1,1)
 cprint(0x00FFFF, "=== Claude Crafting ===")
-cprint(0x888888, "Commands: status | search <q> | clear | quit | flush")
+cprint(0x888888, "Commands: status | search <q> | scan_labels | clear | quit | flush")
 print()
 cprint(0x00FF00, "[OK] Server connected: "..SERVER)
 print()
@@ -543,6 +543,50 @@ while true do
       dbg("search result ("..#results.."): "..table.concat(results,", "))
     end
     flushDebug("search-"..q)
+
+  elseif input:lower()=="scan_labels" then
+    -- Deliberately a manual, explicitly-triggered command -- NOT run
+    -- automatically on boot or per-request. me.getItemsInNetwork() with
+    -- no filter enumerates the WHOLE ME network; buildInventory() above
+    -- already calls it every craft request for item counts, but this
+    -- command additionally captures each item's .label and reports the
+    -- id->label pairs to the server so it can build a persistent,
+    -- reusable name index (item_labels.json) -- see claude_test.py's
+    -- handle_report_labels(). Keeping this a manual command (rather than
+    -- doing the label-capture-and-report every time buildInventory()
+    -- runs) is what keeps the extra network-wide sweep + upload rare.
+    dbg("scan_labels command")
+    cwrite(0x888888,"[~] Scanning ME network for item labels (may take a moment)... ")
+    local ok, items = pcall(me.getItemsInNetwork)
+    if not ok or not items then
+      cprint(0xFF4444, "failed: "..tostring(items))
+      dbg("scan_labels: getItemsInNetwork failed: "..tostring(items))
+      flushDebug("scan-labels-fail")
+    else
+      local entries = {}
+      for _, it in ipairs(items) do
+        if it.name and it.label then
+          entries[#entries+1] = {id = it.name, damage = it.damage or 0, label = it.label}
+        end
+      end
+      cprint(0x00FF00, "done. "..#entries.." labeled item(s) found. Reporting to server...")
+      dbg("scan_labels: reporting "..#entries.." entries")
+      local raw, perr = post("/report_labels", {entries=entries})
+      if not raw then
+        cprint(0xFF4444, "[ERR] report failed: "..(perr or "?"))
+        dbg("scan_labels: report failed: "..(perr or "?"))
+        flushDebug("scan-labels-report-fail")
+      else
+        local newCount     = extractNum(raw, "new") or 0
+        local changedCount = extractNum(raw, "changed") or 0
+        local totalCount   = extractNum(raw, "total") or #entries
+        cprint(0x00FFFF, string.format(
+          "[OK] label db updated -- %d new, %d changed, %d total known.",
+          newCount, changedCount, totalCount))
+        dbg("scan_labels: report ok -- "..newCount.." new, "..changedCount.." changed, "..totalCount.." total")
+        flushDebug("scan-labels-ok")
+      end
+    end
 
   else
     dbg("craft request: "..input)
