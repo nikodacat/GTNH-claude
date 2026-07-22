@@ -201,21 +201,35 @@ local function enc(v)
 end
 
 -- ── HTTP helpers ──────────────────────────────
-local function httpDo(url, body, headers)
-  dbg("HTTP ".. (body and "POST" or "GET") .." "..url:sub(1,50))
+-- `quiet`, if true, skips every dbg() call in here (URL/connect/response
+-- tracing) -- added because the background job-poll timer calls get()
+-- every JOB_POLL_INTERVAL (10s) FOREVER, and the routine "nothing queued"
+-- case was going through the exact same per-request tracing meant for
+-- one-off interactive commands (status/search/scan_labels), which get
+-- flushed to chat right after. The poll tick never flushes on its own
+-- (nothing interesting happened), so those lines just piled up in
+-- debugLines silently -- until any later flush (an unrelated "flush"/
+-- "status"/etc. command) dumped the ENTIRE accumulated backlog into chat
+-- in one burst (this is exactly what was reported: hundreds of
+-- "waiting for connect... connected... {"job": null}" lines flooding the
+-- web viewer at once). `quiet` doesn't touch dbg() itself or the
+-- meaningful, rare log lines callers add around a quiet call (e.g.
+-- "job-poll: /next_job failed") -- only the routine HTTP-level tracing.
+local function httpDo(url, body, headers, quiet)
+  if not quiet then dbg("HTTP ".. (body and "POST" or "GET") .." "..url:sub(1,50)) end
   local req, err = net.request(url, body, headers)
   if not req then
-    dbg("  request() failed: "..(err or "?"))
+    if not quiet then dbg("  request() failed: "..(err or "?")) end
     return nil, err
   end
-  dbg("  waiting for connect...")
+  if not quiet then dbg("  waiting for connect...") end
   local dl=computer.uptime()+30
   while computer.uptime()<dl do
     local ok,e2=req.finishConnect()
-    if ok then dbg("  connected"); break end
+    if ok then if not quiet then dbg("  connected") end; break end
     if ok==nil then
       req.close()
-      dbg("  connect failed: "..(e2 or "?"))
+      if not quiet then dbg("  connect failed: "..(e2 or "?")) end
       return nil, e2
     end
     os.sleep(0.05)
@@ -227,17 +241,19 @@ local function httpDo(url, body, headers)
     r=r..chunk
   end
   req.close()
-  dbg("  response len="..#r)
-  if #r > 0 then dbg("  response preview: "..r:sub(1,80)) end
+  if not quiet then
+    dbg("  response len="..#r)
+    if #r > 0 then dbg("  response preview: "..r:sub(1,80)) end
+  end
   return r, nil
 end
 
-local function post(path, tbl)
-  return httpDo(SERVER..path, enc(tbl), {["Content-Type"]="application/json"})
+local function post(path, tbl, quiet)
+  return httpDo(SERVER..path, enc(tbl), {["Content-Type"]="application/json"}, quiet)
 end
 
-local function get(path)
-  return httpDo(SERVER..path)
+local function get(path, quiet)
+  return httpDo(SERVER..path, nil, nil, quiet)
 end
 
 -- ── simple JSON field extractor ───────────────
@@ -377,7 +393,7 @@ local function claimAndStartJobs()
   end
 
   for _, freeCpu in ipairs(freeCpus) do
-    local raw, err = get("/next_job")
+    local raw, err = get("/next_job", true)  -- quiet: this fires every ~10s forever, don't trace it
     if not raw then
       dbg("job-poll: /next_job failed: "..(err or "?"))
       break  -- server hiccup -- stop for this tick, next tick retries
