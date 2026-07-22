@@ -18,6 +18,9 @@
 #    GET  /craft_plan           -- static recipe-tree plan for item+qty (phase 1, no live AE2)
 #    POST /report_labels        -- bulk id->label report from a manual ME network label scan (OC)
 #    GET  /resolve_name         -- label (display name) -> id lookup, built from scanned labels
+#    POST /request_craft        -- Claude (via tools/request_craft.py) queues a craft job
+#    GET  /next_job             -- OC's background poll: claim the oldest queued craft job
+#    POST /report_job_result    -- OC reports a claimed job's outcome (success/failure + details)
 # =============================================
 
 import http.server
@@ -253,6 +256,42 @@ def find_items_by_label(query, limit=10):
             if len(results) >= limit:
                 break
     return results
+
+
+# ── crafting job queue (Claude-dispatched, OC-executed) ────────────────
+# Claude gets scoped tool access (see tools/*.py + ask_claude()'s
+# --allowedTools) so it can decide to actually request a craft, not just
+# talk about one. Claude can NEVER execute anything itself, though --
+# only the physical OC computer has an AE2 connection, and the server
+# has no way to push a command into the game (OC always initiates via
+# HTTP, never the other way around). So POST /request_craft only
+# enqueues a job here; craft_oc.lua's own background poll (GET
+# /next_job, on a timer, independent of whether anyone's typing at the
+# terminal -- since a request can just as easily come from the web chat)
+# is what actually claims and runs it, checking for a free AE2 CPU
+# immediately before submitting (CPU availability can change between
+# when a job is queued and whenever OC gets around to it -- "check
+# before execute", not at queue time), then reports the outcome back via
+# POST /report_job_result.
+PENDING_JOBS_PATH = "pending_jobs.json"
+pending_jobs = {}   # job_id -> {id, item, qty, leaves, steps, status, requested_at, result}
+pending_jobs_lock = threading.Lock()
+
+def load_pending_jobs():
+    global pending_jobs
+    if not os.path.exists(PENDING_JOBS_PATH):
+        print(f"[~] {PENDING_JOBS_PATH} not found -- starting with an empty job queue.")
+        return
+    with open(PENDING_JOBS_PATH, "r", encoding="utf-8") as f:
+        pending_jobs = json.load(f)
+    print(f"[~] Loaded pending_jobs.json: {len(pending_jobs):,} job(s) on record.")
+
+def save_pending_jobs():
+    """Write pending_jobs back to disk. Caller must hold pending_jobs_lock."""
+    tmp_path = PENDING_JOBS_PATH + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(pending_jobs, f, ensure_ascii=False, indent=2)
+    os.replace(tmp_path, PENDING_JOBS_PATH)
 
 
 # ── craft tree planner -- PHASE 1: static, recipe_db.json + ore_dict.json
@@ -619,9 +658,28 @@ def check_claude():
     print("      Sign in: claude")
     return False
 
+# ── crafting tools system prompt ───────────────────────────────
+# Always prepended inside ask_claude() (not left up to whatever `system`
+# string a given client happens to send) so both the web chat and every
+# OC terminal script get the same tool-usage instructions regardless of
+# their own context. See tools/*.py for the actual scripts -- each is a
+# thin wrapper around an existing server endpoint, so there's exactly
+# one implementation of each lookup no matter who calls it.
+CRAFT_TOOLS_SYSTEM = """You have access to four command-line tools (run them with your Bash tool, exactly as shown -- nothing else is permitted):
+  python3 tools/resolve_item.py <name>          -- resolve an item name/label (English or otherwise -- translate it yourself first if needed) to candidate item ids
+  python3 tools/get_recipe.py <item_id>          -- look up recipe_db.json recipes for an exact item id
+  python3 tools/craft_plan.py <item_id> [qty]    -- get the static craft-tree plan for item+qty
+  python3 tools/request_craft.py <item_id> <qty> -- QUEUE a craft request (does NOT execute it -- see below)
+
+Important limits on request_craft.py, since this is easy to get wrong:
+- It only adds the job to a queue. Only the physical OC computer in-game can actually touch AE2 (check a free crafting CPU, submit the request) -- it picks up queued jobs on its own background schedule, not instantly. Tell the player it's QUEUED, never that it's done.
+- Completion is reported separately later, as its own chat message, once the OC side finishes the job -- you will not see that result in this same turn.
+- If craft_plan.py or request_craft.py returns a non-empty "needs_player_input", that means a real recipe ambiguity or dependency loop the planner can't resolve alone -- explain the options to the player and ask them to choose. Do not call request_craft.py again for that item until they do, and do not guess.
+- Only use request_craft.py when the player has actually asked for something to be crafted -- use craft_plan.py/get_recipe.py/resolve_item.py freely just to answer questions, without queuing anything."""
+
 # ── call claude -p ────────────────────────────────────────────
 def ask_claude(messages, system=None):
-    parts = []
+    parts = [f"[System]\n{CRAFT_TOOLS_SYSTEM}\n"]
     if system:
         parts.append(f"[System]\n{system}\n")
     for msg in messages:
@@ -630,21 +688,32 @@ def ask_claude(messages, system=None):
     parts.append("[Assistant]\n(reply below)")
     prompt = "\n\n".join(parts)
 
+    # Scoped to exactly these 4 scripts -- Claude cannot run arbitrary Bash
+    # commands, only these specific invocations. Both "python3" and
+    # "python" prefixes are allowed since which one resolves depends on
+    # the player's own PC setup (this server has no way to verify that
+    # from here).
+    craft_tool_scripts = ["resolve_item.py", "get_recipe.py", "craft_plan.py", "request_craft.py"]
+    allowed_tools = []
+    for script in craft_tool_scripts:
+        allowed_tools.append(f"Bash(python3 tools/{script}:*)")
+        allowed_tools.append(f"Bash(python tools/{script}:*)")
+
     try:
         result = subprocess.run(
-            [CLAUDE_PATH, "-p", prompt],
+            [CLAUDE_PATH, "-p", prompt, "--allowedTools"] + allowed_tools,
             capture_output=True,
             text=True,
             encoding="utf-8",
             errors="replace",
-            timeout=60
+            timeout=90  # a bit higher than before -- tool calls (subprocess + HTTP round trip) add latency
         )
         if result.returncode != 0:
             err = result.stderr.strip() or "unknown error"
             return None, f"claude exited {result.returncode}: {err}"
         return result.stdout.strip(), None
     except subprocess.TimeoutExpired:
-        return None, "claude timed out (>60s)"
+        return None, "claude timed out (>90s)"
     except Exception as e:
         return None, str(e)
 
@@ -1501,6 +1570,27 @@ class Handler(http.server.BaseHTTPRequestHandler):
             results = find_items_by_label(query, limit) if query else []
             self.send_json(200, {"query": query, "found": len(results) > 0, "count": len(results), "results": results})
 
+        elif self.path.startswith("/next_job"):
+            # OC's background poll -- claims the OLDEST still-queued job (if
+            # any) and marks it in_progress so a second/overlapping poll
+            # doesn't also pick it up. One job at a time, deliberately --
+            # running multiple craft jobs concurrently across machines is
+            # future work (see "Future crafting system plan" in project
+            # memory), not built here.
+            with pending_jobs_lock:
+                candidates = [j for j in pending_jobs.values() if j.get("status") == "queued"]
+                candidates.sort(key=lambda j: j.get("requested_at", ""))
+                if not candidates:
+                    self.send_json(200, {"job": None})
+                else:
+                    job = candidates[0]
+                    job["status"] = "in_progress"
+                    try:
+                        save_pending_jobs()
+                    except Exception as e:
+                        print(f"[craft-job][err] failed to save pending_jobs.json: {e}")
+                    self.send_json(200, {"job": job})
+
         else:
             self.send_json(404, {"error": "not found"})
 
@@ -1548,6 +1638,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         if self.path == "/report_labels":
             self.handle_report_labels()
+            return
+
+        if self.path == "/request_craft":
+            self.handle_request_craft()
+            return
+
+        if self.path == "/report_job_result":
+            self.handle_report_job_result()
             return
 
         if self.path != "/chat":
@@ -1868,6 +1966,100 @@ class Handler(http.server.BaseHTTPRequestHandler):
             "new": new_count, "changed": changed_count, "total": total,
         })
 
+    # ── crafting job queue endpoints ─────────────────────────────
+    def handle_request_craft(self):
+        """Called by tools/request_craft.py, which Claude invokes when it
+        decides to actually dispatch a craft request rather than just
+        answer a question. This NEVER executes anything -- it builds the
+        same static plan /craft_plan would (reusing build_craft_tree) and,
+        ONLY if that plan is confident (no loop/ambiguity flagged), queues
+        it. If the plan needs player input, this refuses to queue and
+        returns the same needs_player_input info /craft_plan would --
+        Claude should relay that to the player instead of queuing a plan
+        it isn't sure about."""
+        data, err = self._read_json_body()
+        if err:
+            self.send_json(400, {"error": err})
+            return
+
+        item = data.get("item")
+        try:
+            qty = max(1, int(data.get("qty", 1)))
+        except (TypeError, ValueError):
+            qty = 1
+        if not item:
+            self.send_json(400, {"error": "missing item"})
+            return
+        if not recipe_db:
+            self.send_json(503, {"error": "recipe DB not loaded"})
+            return
+
+        tree = build_craft_tree(item, qty)
+        leaves, steps = flatten_craft_tree(tree)
+        flagged = find_flagged_nodes(tree)
+        if flagged:
+            self.send_json(200, {
+                "queued": False,
+                "reason": "plan needs player input before it can be queued -- see needs_player_input",
+                "needs_player_input": flagged,
+            })
+            return
+
+        job_id = uuid.uuid4().hex[:10]
+        now = time.strftime("%Y-%m-%d %H:%M:%S")
+        with pending_jobs_lock:
+            pending_jobs[job_id] = {
+                "id": job_id, "item": item, "qty": qty,
+                "leaves": leaves, "steps": steps,
+                "status": "queued", "requested_at": now, "result": None,
+            }
+            try:
+                save_pending_jobs()
+            except Exception as e:
+                del pending_jobs[job_id]
+                print(f"[craft-job][err] failed to save pending_jobs.json: {e}")
+                self.send_json(500, {"error": str(e)})
+                return
+
+        print(f"[craft-job] queued {job_id}: {qty}x {item}")
+        append_log("diag", f"Craft job queued: {qty}x {item} (job {job_id}) -- waiting for the OC terminal to pick it up.")
+        self.send_json(200, {"queued": True, "job_id": job_id, "item": item, "qty": qty, "leaves": leaves})
+
+    def handle_report_job_result(self):
+        """OC reports the outcome of a job it claimed via GET /next_job --
+        success or failure, plus a short human-readable details string
+        (e.g. which CPU was used, or why it couldn't run). Pushes a
+        player-visible chat log entry either way, since the original
+        request could have come from the web chat with nobody at the OC
+        terminal to see it happen live."""
+        data, err = self._read_json_body()
+        if err:
+            self.send_json(400, {"error": err})
+            return
+
+        job_id  = data.get("job_id")
+        success = bool(data.get("success", False))
+        details = data.get("details", "")
+
+        with pending_jobs_lock:
+            job = pending_jobs.get(job_id)
+            if not job:
+                self.send_json(404, {"error": "unknown job_id"})
+                return
+            job["status"] = "done" if success else "failed"
+            job["result"] = details
+            try:
+                save_pending_jobs()
+            except Exception as e:
+                print(f"[craft-job][err] failed to save pending_jobs.json: {e}")
+                append_log("error", f"failed to save pending_jobs.json: {e}")
+
+        verb = "completed" if success else "FAILED"
+        msg = f"Craft job {job_id} ({job['qty']}x {job['item']}) {verb}: {details}"
+        print(f"[craft-job] {msg}")
+        append_log("claude", msg)
+        self.send_json(200, {"status": "ok"})
+
 # ── main ──────────────────────────────────────────────────────
 if __name__ == "__main__":
     if not check_claude():
@@ -1878,6 +2070,7 @@ if __name__ == "__main__":
     load_known_patterns()
     load_ore_dict()
     load_item_labels()
+    load_pending_jobs()
 
     # ThreadingHTTPServer, not plain HTTPServer: handle_upload_recipe_image()
     # blocks on a `claude -p` subprocess for up to 120s (vision extraction is
