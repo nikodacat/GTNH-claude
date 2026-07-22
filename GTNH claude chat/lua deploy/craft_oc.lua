@@ -176,27 +176,6 @@ local function fg(c) if gpu then pcall(gpu.setForeground,c) end end
 local function cprint(c,t) fg(c); print(t); fg(0xFFFFFF) end
 local function cwrite(c,t) fg(c); io.write(t); fg(0xFFFFFF) end
 
-local function wrap(text, width)
-  local lines={}
-  for para in (text.."\n"):gmatch("(.-)\n") do
-    local line=""
-    for word in para:gmatch("%S+") do
-      if #line+#word+1>width then lines[#lines+1]=line; line=word
-      else line=line==""and word or line.." "..word end
-    end
-    lines[#lines+1]=line
-  end
-  return lines
-end
-
-local function printWrapped(col, prefix, text)
-  local ind=string.rep(" ",#prefix)
-  for i,line in ipairs(wrap(text,W-#prefix)) do
-    fg(col); io.write(i==1 and prefix or ind)
-    fg(0xFFFFFF); io.write(line.."\n")
-  end
-end
-
 -- ── JSON encode ───────────────────────────────
 local function enc(v)
   local t=type(v)
@@ -462,37 +441,6 @@ local function jobPollTick()
   if not ok2 then dbg("claimAndStartOneJob errored: "..tostring(e2)) end
 end
 
-local ALWAYS={"plank","stick","stone","iron_ingot","gold_ingot",
-  "copper","tin","redstone","diamond","coal","glass","rubber","steel"}
-
-local function relevantInventory(userMsg, inv)
-  local keywords={}
-  for w in userMsg:lower():gmatch("%a+") do
-    if #w>=3 then keywords[#keywords+1]=w end
-  end
-  for _,k in ipairs(ALWAYS) do keywords[#keywords+1]=k end
-  local result,seen={},{}
-  local function tryAdd(name,amt)
-    if not seen[name] and #result<50 then
-      seen[name]=true; result[#result+1]=name.." x"..amt
-    end
-  end
-  for name,amt in pairs(inv) do
-    for _,kw in ipairs(keywords) do
-      if name:lower():find(kw,1,true) then tryAdd(name,amt); break end
-    end
-  end
-  local rest={}
-  for name,amt in pairs(inv) do
-    if not seen[name] then rest[#rest+1]={name=name,amt=amt} end
-  end
-  table.sort(rest,function(a,b) return a.amt>b.amt end)
-  for _,r in ipairs(rest) do
-    if #result>=50 then break end; tryAdd(r.name,r.amt)
-  end
-  return table.concat(result,"\n")
-end
-
 -- ── recipe lookup ─────────────────────────────
 local function searchItems(query, limit)
   limit=limit or 8
@@ -506,103 +454,25 @@ local function searchItems(query, limit)
   return results
 end
 
-local function lookupRecipe(itemName)
-  local encoded=itemName:gsub(":","%%3A")
-  local raw,err=get("/recipe?item="..encoded)
-  if not raw then return nil, err end
-  local found=raw:find('"found":%s*true')~=nil
-  if not found then return nil,nil end
-  local gridStr=raw:match('"grid":%s*(%[.-%])')
-  local ingStr =raw:match('"ingredients":%s*(%[.-%])')
-  local rtype  =raw:match('"type":%s*"([^"]+)"')
-  local function parseArr(s)
-    if not s then return nil end
-    local full={}
-    for entry in s:gmatch('([^,%[%]]+)') do
-      entry=entry:match("^%s*(.-)%s*$")
-      if entry=="null" then full[#full+1]=nil
-      elseif entry:sub(1,1)=='"' then
-        full[#full+1]=entry:match('"([^"]*)"')
-      end
-    end
-    return full
-  end
-  return {
-    type=rtype,
-    grid=gridStr and parseArr(gridStr) or nil,
-    ingredients=ingStr and parseArr(ingStr) or nil,
-  }, nil
-end
-
--- ── AE2 autocraft ─────────────────────────────
-local function triggerAutocraft(itemName, amount)
-  dbg("triggerAutocraft("..itemName..", "..amount..")")
-  local ok, craftables = pcall(me.getCraftables)
-  if not ok or not craftables then
-    dbg("  getCraftables failed")
-    return false, "cannot query craftables"
-  end
-  local target=nil
-  for _,c in ipairs(craftables) do
-    if c.name==itemName then target=c; break end
-  end
-  if not target then
-    dbg("  no pattern found for "..itemName)
-    return false, "no AE2 pattern for "..itemName
-  end
-  dbg("  found craftable, requesting "..amount)
-  local job
-  ok,job=pcall(function() return target.request(amount) end)
-  if not ok then
-    dbg("  request() error: "..tostring(job))
-    return false, "request() failed: "..tostring(job)
-  end
-  dbg("  job submitted, polling...")
-  cwrite(0x888888,"  [~] Crafting")
-  local deadline=computer.uptime()+90
-  while computer.uptime()<deadline do
-    os.sleep(2); io.write(".")
-    local ok2,done=pcall(function() return job.isDone() end)
-    local ok3,cancelled=pcall(function() return job.isCanceled() end)
-    dbg("  poll: done="..tostring(done).." cancelled="..tostring(cancelled))
-    if ok2 and done then print(); return true,nil end
-    if ok3 and cancelled then print(); return false,"job cancelled by AE2" end
-  end
-  print()
-  return true,"timed out polling"
-end
-
 -- ── main ──────────────────────────────────────
-local history={}
-
-local SYSTEM=[[
-You are a Minecraft crafting assistant for GTNH connected to an AE2 ME system.
-You will receive: player request, ME inventory snapshot, AE2 craftable list,
-and optionally a verified recipe from the recipe database.
-
-Always respond with a single JSON object only — no prose, no markdown.
-
-{
-  "message": "reply shown to player",
-  "action": "craft" | "explain" | "chat",
-  "item": "exact:item:id or null",
-  "amount": 1,
-  "warn": "caveat or null"
-}
-
-Action rules:
-- "craft"  : item has an AE2 pattern AND materials exist. Use exact item ID.
-- "explain": no pattern, or materials missing, or needs GT machine.
-- "chat"   : general question, no crafting needed.
-
-Only use "craft" if item appears in the craftable list.
-If a verified recipe from the DB is provided, use it.
-Otherwise note that GTNH recipes may differ from vanilla.
-]]
+-- NOTE (2026-07-22): this script used to ALSO forward free-typed input to
+-- Claude via POST /chat (with its own JSON action-schema SYSTEM prompt)
+-- and, on an "action":"craft" reply, call a local triggerAutocraft() that
+-- submitted straight to AE2 with no CPU selection or free-CPU check at
+-- all (plain target.request(amount)) -- this was exactly the "stucks the
+-- CPU, only uses 1 CPU" behavior that motivated the whole job-queue
+-- system above. Both the chat-forwarding branch and triggerAutocraft()
+-- have been REMOVED, not just disabled: all real conversation with
+-- Claude now happens through the web viewer only (which has its own full
+-- chat UI), and Claude dispatches crafts via tools/request_craft.py ->
+-- the job queue -> claimAndStartOneJob() above, which DOES check for a
+-- free CPU before submitting. This terminal now only handles direct
+-- commands (status/search/scan_labels) plus the background job poll.
 
 term.clear(); term.setCursor(1,1)
 cprint(0x00FFFF, "=== Claude Crafting ===")
 cprint(0x888888, "Commands: status | search <q> | scan_labels | clear | quit | flush")
+cprint(0x888888, "(chat with Claude now happens from the web viewer -- this terminal just runs commands + crafts)")
 print()
 cprint(0x00FF00, "[OK] Server connected: "..SERVER)
 print()
@@ -668,8 +538,8 @@ while true do
     print("done")
 
   elseif input:lower()=="clear" then
-    history={}; debugLines={}
-    cprint(0x888888,"[i] History + debug cleared.")
+    debugLines={}
+    cprint(0x888888,"[i] Debug log cleared.")
 
   elseif input:lower()=="status" then
     dbg("status command")
@@ -741,108 +611,10 @@ while true do
     end
 
   else
-    dbg("craft request: "..input)
-    cwrite(0x888888,"[~] Scanning ME... ")
-    local inv=buildInventory()
-    local craftables=getCraftables()
-    local invSummary=relevantInventory(input,inv)
-    local craftList=table.concat(craftables,"\n")
-    dbg("inv types="..tostring(#invSummary).." craftables="..#craftables)
-    cprint(0x888888,"done.")
-
-    -- recipe DB lookup
-    local recipeContext="(No recipe DB match)"
-    local words={}
-    for w in input:gmatch("%S+") do words[#words+1]=w end
-    local hint=table.concat(words,"_"):lower()
-    dbg("recipe hint: "..hint)
-    local searchResults=searchItems(hint,3)
-    dbg("search results: "..#searchResults)
-    if #searchResults>0 then
-      dbg("looking up: "..searchResults[1])
-      local r,err=lookupRecipe(searchResults[1])
-      if r then
-        dbg("recipe found, type="..tostring(r.type))
-        if r.type=="crafting_shaped" and r.grid then
-          local g=r.grid
-          local gs=table.concat((function()
-            local t={}
-            for _,s in ipairs(g) do t[#t+1]=(s or "null") end
-            return t
-          end)(),", ")
-          recipeContext=string.format(
-            "[Recipe DB]\nItem: %s\nType: %s\nGrid: %s",
-            searchResults[1],r.type,gs)
-        elseif r.type=="crafting_shapeless" and r.ingredients then
-          recipeContext=string.format(
-            "[Recipe DB]\nItem: %s\nType: shapeless\nIngredients: %s",
-            searchResults[1],table.concat(r.ingredients,", "))
-        end
-      else
-        dbg("recipe not found or err: "..tostring(err))
-      end
-    end
-
-    local context=string.format(
-      "%s\n\n[AE2 Craftable]\n%s\n\n[ME Inventory]\n%s",
-      recipeContext,
-      craftList~=""and craftList or "(none)",
-      invSummary)
-
-    history[#history+1]={role="user",content=input.."\n\n"..context}
-
-    dbg("posting to /chat, history len="..#history)
-    cwrite(0x888888,"[~] Asking Claude... ")
-    local raw,err=post("/chat",{messages=history,system=SYSTEM,source="oc"})
-
-    if not raw then
-      dbg("POST failed: "..(err or "?"))
-      flushDebug("post-fail")
-      cprint(0xFF4444,"\n[ERR] "..(err or "?")); history[#history]=nil
-      goto continue
-    end
-
-    dbg("response received, len="..#raw)
-    local message=extractStr(raw,"message") or raw
-    local action =extractStr(raw,"action")  or "chat"
-    local item   =extractStr(raw,"item")
-    local amount =extractNum(raw,"amount")  or 1
-    local warn   =extractStr(raw,"warn")
-    local hasCJK =raw:find('"has_cjk":%s*true')~=nil
-
-    dbg("action="..tostring(action).." item="..tostring(item).." hasCJK="..tostring(hasCJK))
-
-    history[#history+1]={role="assistant",content=message}
-
-    if hasCJK then
-      cprint(0xFFAA00,"[!] Full reply on web viewer (contains non-ASCII).")
-    end
-
-    print()
-    printWrapped(0x00FFFF,"Claude: ",message)
-    if warn and warn~="null" and warn~="" then
-      cprint(0xFFAA00,"[!] "..warn)
-    end
-
-    if action=="craft" and item and item~="null" then
-      cprint(0xFFFF00,string.format("\n[Autocraft] %s x%d",item,amount))
-      dbg("autocraft start: "..item.." x"..amount)
-      local ok,aerr=triggerAutocraft(item,amount)
-      if ok then
-        cprint(0x00FF00,"  [+] Done!")
-        dbg("autocraft result: SUCCESS")
-      else
-        cprint(0xFF4444,"  [!] "..(aerr or "failed"))
-        dbg("autocraft result: FAILED - "..(aerr or "failed"))
-      end
-      flushDebug("autocraft-"..item)
-    elseif action=="explain" then
-      cprint(0xFFAA00,"\n[No pattern] Cannot autocraft — see recipe above.")
-      cprint(0x888888,"  -> Encode a pattern in ME Pattern Terminal to enable.")
-      dbg("explain-only response, no AE2 pattern for this item")
-    end
-
-    flushDebug("request-"..input:sub(1,20))
+    dbg("unknown command: "..input)
+    cprint(0xFFAA00, "[?] Unknown command. Commands: status | search <q> | scan_labels | clear | quit | flush")
+    cprint(0x888888, "    To chat with Claude or request a craft, use the web viewer.")
+    flushDebug("unknown-command")
   end
 
   ::continue::
