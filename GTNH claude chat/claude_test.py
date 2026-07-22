@@ -297,26 +297,29 @@ def save_pending_jobs():
 
 # ── machine identity tracking (interface_meta.json) ────────────────────
 # Answers "which physical machine does this me_interface actually belong
-# to". Convention (user's own design): a newly-set-up, not-yet-labeled
-# machine gets a real, validly-encoded pattern for plain minecraft:stick
-# (damage 0) placed in one of its me_interface's pattern slots as a
-# marker -- deliberately reusing the exact recipe (2 planks + saw ->
-# stick) already proven to validate via getCraftables() in this
-# project's pattern-writing history, so the marker itself is a real,
-# working pattern, not a fake/invalid one. scan_patterns_oc.lua needs NO
-# changes for this -- it already reports every occupied slot's exact
-# output id/damage via POST /report_pattern, so the marker check happens
+# to". Originally required a specific minecraft:stick marker pattern to
+# be manually placed before an interface would be flagged -- simplified
+# 2026-07-22 (user's own call): that's unnecessary. The interface simply
+# never having been reported before (this address not yet in
+# interface_meta) is already a perfectly good "new machine, please
+# label" signal, regardless of what pattern triggered the report.
+# scan_patterns_oc.lua needs NO changes for this -- it already reports
+# every occupied slot via POST /report_pattern, so the check happens
 # entirely here in handle_report_pattern (see below).
 #
-# First time a marker is seen on an interface: record it with
+# Accepted limitation (confirmed with the user, not a bug): a genuinely
+# bare interface with ZERO occupied pattern slots produces nothing for
+# scan_patterns_oc.lua to report at all, so it won't be noticed until it
+# has at least one real pattern in it. Fine as-is -- that'll happen
+# naturally once the machine is actually put to use.
+#
+# First time ANY pattern is reported for an interface: record it with
 # machine=None and push ONE chat prompt asking what it is. Every scan
-# after that (until answered) sees the same marker again but does NOT
+# after that (until answered) sees the same interface again but does NOT
 # re-prompt -- silently skipped once an entry already exists. Once
 # labeled via POST /label_machine (Claude calls this through
 # tools/label_machine.py when the player answers in chat), machine gets
-# set and the marker is simply ignored on every future scan.
-STICK_MARKER_ID = "minecraft:stick"
-STICK_MARKER_DAMAGE = 0
+# set and future scans of that interface are simply ignored for this purpose.
 INTERFACE_META_PATH = "interface_meta.json"
 interface_meta = {}   # interface_address -> {interface_address, interface_label, machine, first_marker_seen, marker_pattern_index}
 interface_meta_lock = threading.Lock()
@@ -722,7 +725,7 @@ Important limits on request_craft.py, since this is easy to get wrong:
 - If craft_plan.py or request_craft.py returns a non-empty "needs_player_input", that means a real recipe ambiguity or dependency loop the planner can't resolve alone -- explain the options to the player and ask them to choose. Do not call request_craft.py again for that item until they do, and do not guess.
 - Only use request_craft.py when the player has actually asked for something to be crafted -- use craft_plan.py/get_recipe.py/resolve_item.py freely just to answer questions, without queuing anything.
 
-About label_machine.py: when a machine's ME interface has never been identified yet, a scan reports it and you'll see a chat message like "Found an unlabeled machine -- interface \"<label>\" (stick marker in pattern slot N). What machine is this?" -- that message (earlier in this same conversation) contains the exact interface_address to use. When the player answers (e.g. "that one's the Circuit Assembler"), call label_machine.py with that same interface_address and the name they gave. Never invent or guess an interface_address that wasn't given to you in an actual scan message."""
+About label_machine.py: when a machine's ME interface has never been identified yet, a scan reports it and you'll see a chat message like "Found an unidentified machine -- interface \"<label>\" (address <addr>). What machine is this?" -- that message (earlier in this same conversation) contains the exact interface_address to use. When the player answers (e.g. "that one's the Circuit Assembler"), call label_machine.py with that same interface_address and the name they gave. Never invent or guess an interface_address that wasn't given to you in an actual scan message."""
 
 # ── call claude -p ────────────────────────────────────────────
 def ask_claude(messages, system=None):
@@ -1085,12 +1088,13 @@ WEB_PAGE = """<!DOCTYPE html>
     'assistant. You may be given a [Recipe DB] block containing a ' +
     'verified crafting recipe -- use it if present, and say so plainly ' +
     'if no recipe was found (note that GTNH recipes often differ from ' +
-    'vanilla Minecraft). This conversation is running from a web ' +
-    'browser with no live connection to the player\\'s in-game inventory ' +
-    'or AE2 network -- you cannot check what they have in stock and ' +
-    'cannot trigger an actual craft from here. If they want to execute ' +
-    'a craft for real, tell them to do it from the in-game OC terminal. ' +
-    'Reply conversationally and concisely.';
+    'vanilla Minecraft). This conversation is running from a web browser, ' +
+    'same as chatting from the in-game OC terminal -- you can request a ' +
+    'real craft here using your tools (request_craft.py), it will be ' +
+    'queued and the in-game OC computer will pick it up and run it in the ' +
+    'background, checking for a free AE2 CPU first. Tell the player it\\'s ' +
+    'queued, not that it\\'s done -- completion is reported separately once ' +
+    'the OC side finishes. Reply conversationally and concisely.';
 
   let convHistory = []; // {role:'user'|'assistant', content:string}
 
@@ -1961,43 +1965,39 @@ class Handler(http.server.BaseHTTPRequestHandler):
             print(f"[pattern-scan] {msg}")
             append_log("diag", msg)
 
-        # ── stick-marker check (unlabeled machine detection) ──────
+        # ── unidentified-machine detection ────────────────────────
         # Independent of is_new/is_changed above (which track the pattern
-        # CONTENT, not the machine-labeling workflow) -- runs every time
-        # this interface reports a stick-output pattern, but only ever
-        # prompts once per interface (see load/save_interface_meta above).
-        is_marker = any(
-            o.get("id") == STICK_MARKER_ID and (o.get("damage", 0) or 0) == STICK_MARKER_DAMAGE
-            for o in outputs
-        )
-        if is_marker:
-            with interface_meta_lock:
-                if addr not in interface_meta:
-                    interface_meta[addr] = {
-                        "interface_address": addr,
-                        "interface_label": label,
-                        "machine": None,
-                        "first_marker_seen": now,
-                        "marker_pattern_index": idx,
-                    }
-                    try:
-                        save_interface_meta()
-                        should_prompt = True
-                    except Exception as e:
-                        print(f"[machine-label][err] failed to save interface_meta.json: {e}")
-                        append_log("error", f"failed to save interface_meta.json: {e}")
-                        should_prompt = False
-                else:
-                    should_prompt = False  # already recorded (labeled or already prompted) -- don't spam
-            if should_prompt:
-                # The raw address MUST appear here, not just the friendly
-                # label -- this is the only place Claude ever sees it, and
-                # tools/label_machine.py needs the exact address (matching
-                # interface_meta.json's key), not a shortened display name.
-                prompt_msg = (f"Found an unlabeled machine -- interface \"{label}\" "
-                              f"(address {addr}, stick marker in pattern slot {idx}). What machine is this?")
-                print(f"[machine-label] {prompt_msg}")
-                append_log("claude", prompt_msg)
+        # CONTENT, not the machine-labeling workflow) -- runs on every
+        # report, but only ever prompts once per interface (see
+        # load/save_interface_meta's comment above for why no marker
+        # pattern is needed anymore).
+        with interface_meta_lock:
+            if addr not in interface_meta:
+                interface_meta[addr] = {
+                    "interface_address": addr,
+                    "interface_label": label,
+                    "machine": None,
+                    "first_seen": now,
+                    "first_seen_pattern_index": idx,
+                }
+                try:
+                    save_interface_meta()
+                    should_prompt = True
+                except Exception as e:
+                    print(f"[machine-label][err] failed to save interface_meta.json: {e}")
+                    append_log("error", f"failed to save interface_meta.json: {e}")
+                    should_prompt = False
+            else:
+                should_prompt = False  # already recorded (labeled or already prompted) -- don't spam
+        if should_prompt:
+            # The raw address MUST appear here, not just the friendly
+            # label -- this is the only place Claude ever sees it, and
+            # tools/label_machine.py needs the exact address (matching
+            # interface_meta.json's key), not a shortened display name.
+            prompt_msg = (f"Found an unidentified machine -- interface \"{label}\" "
+                          f"(address {addr}). What machine is this?")
+            print(f"[machine-label] {prompt_msg}")
+            append_log("claude", prompt_msg)
 
         self.send_json(200, {"status": "ok", "new": is_new, "changed": is_changed})
 
