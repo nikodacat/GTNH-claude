@@ -16,6 +16,8 @@
 #    POST /report_pattern       -- report one scanned ME interface pattern (OC)
 #    GET  /oredict              -- resolve an ore:xxx tag to concrete items
 #    GET  /craft_plan           -- static recipe-tree plan for item+qty (phase 1, no live AE2)
+#    POST /report_labels        -- bulk id->label report from a manual ME network label scan (OC)
+#    GET  /resolve_name         -- label (display name) -> id lookup, built from scanned labels
 # =============================================
 
 import http.server
@@ -206,6 +208,51 @@ def describe_item(entry):
     label = entry.get("label") or entry.get("id", "?")
     count = entry.get("count", 1)
     return f"{count}x {label}"
+
+
+# ── item label index (id:meta -> display name) ────────────────────────
+# recipe_db.json and ore_dict.json only ever store internal item ids
+# (e.g. "gregtech:gt.metaitem.01:17809") -- neither has ever carried a
+# human-readable display name. This index fills that gap, but
+# deliberately NOT via a live AE2 call on every lookup: a full,
+# unfiltered me_controller.getItemsInNetwork() sweep enumerates the
+# WHOLE ME network, which the user flagged as something that can lag
+# the server if done casually/often. So this is built from an
+# infrequent, explicitly player-triggered scan (the "scan_labels"
+# command in craft_oc.lua's chat loop) rather than an automatic
+# per-request lookup -- see handle_report_labels() below. A miss in
+# this index just means "hasn't been scanned yet", not "doesn't exist".
+ITEM_LABELS_PATH = "item_labels.json"
+item_labels = {}  # "id:meta" -> label (display name, whatever language the server's own locale resolves to)
+item_labels_lock = threading.Lock()
+
+def load_item_labels():
+    global item_labels
+    if not os.path.exists(ITEM_LABELS_PATH):
+        print(f"[~] {ITEM_LABELS_PATH} not found -- starting with an empty label index.")
+        return
+    with open(ITEM_LABELS_PATH, "r", encoding="utf-8") as f:
+        item_labels = json.load(f)
+    print(f"[~] Loaded item_labels.json: {len(item_labels):,} known item labels.")
+
+def save_item_labels():
+    """Write item_labels back to disk. Caller must hold item_labels_lock."""
+    tmp_path = ITEM_LABELS_PATH + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(item_labels, f, ensure_ascii=False, indent=2)
+    os.replace(tmp_path, ITEM_LABELS_PATH)
+
+def find_items_by_label(query, limit=10):
+    """Case-insensitive substring search over item_labels' values.
+    Returns [{"id_meta": "modid:name:meta", "label": "..."}, ...]."""
+    q = query.lower()
+    results = []
+    for id_meta, label in item_labels.items():
+        if q in label.lower():
+            results.append({"id_meta": id_meta, "label": label})
+            if len(results) >= limit:
+                break
+    return results
 
 
 # ── craft tree planner -- PHASE 1: static, recipe_db.json + ore_dict.json
@@ -1436,6 +1483,24 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     "needs_player_input": flagged,
                 })
 
+        elif self.path.startswith("/resolve_name"):
+            # /resolve_name?q=Wood Plank&limit=5
+            # Display-name -> id lookup, built from item_labels.json (see
+            # handle_report_labels() / the "scan_labels" OC command). Only
+            # ever covers items that scan has actually seen in the ME
+            # network -- a "found: false" here means "not scanned yet",
+            # not "this item doesn't exist".
+            query = ""
+            limit = 10
+            if "q=" in self.path:
+                query = self.path.split("q=")[1].split("&")[0]
+                query = query.replace("%3A", ":").replace("+", " ")
+            if "limit=" in self.path:
+                try: limit = int(self.path.split("limit=")[1].split("&")[0])
+                except: limit = 10
+            results = find_items_by_label(query, limit) if query else []
+            self.send_json(200, {"query": query, "found": len(results) > 0, "count": len(results), "results": results})
+
         else:
             self.send_json(404, {"error": "not found"})
 
@@ -1479,6 +1544,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         if self.path == "/report_pattern":
             self.handle_report_pattern()
+            return
+
+        if self.path == "/report_labels":
+            self.handle_report_labels()
             return
 
         if self.path != "/chat":
@@ -1745,6 +1814,60 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         self.send_json(200, {"status": "ok", "new": is_new, "changed": is_changed})
 
+    # ── item label scan endpoint ─────────────────────────────────
+    def handle_report_labels(self):
+        """Receives a batch of {id, damage, label} entries from a manually-
+        triggered ME network label scan (the "scan_labels" command in
+        craft_oc.lua's chat loop -- see that file). Deliberately a single
+        bulk report, not one call per item: a full unfiltered
+        me_controller.getItemsInNetwork() sweep can return thousands of
+        entries, and this should stay a rare, explicit operation, not
+        something that spams the chat log or hits the disk once per item.
+        """
+        data, err = self._read_json_body()
+        if err:
+            self.send_json(400, {"error": err})
+            return
+
+        entries = data.get("entries", [])
+        if not isinstance(entries, list):
+            self.send_json(400, {"error": "entries must be a list"})
+            return
+
+        new_count, changed_count = 0, 0
+        with item_labels_lock:
+            for e in entries:
+                item_id = e.get("id")
+                damage  = e.get("damage", 0) or 0
+                label   = e.get("label")
+                if not item_id or not label:
+                    continue
+                key = f"{item_id}:{damage}"
+                prev = item_labels.get(key)
+                if prev is None:
+                    new_count += 1
+                elif prev != label:
+                    changed_count += 1
+                item_labels[key] = label
+            try:
+                save_item_labels()
+            except Exception as e:
+                print(f"[label-scan][err] failed to save item_labels.json: {e}")
+                append_log("error", f"failed to save item_labels.json: {e}")
+                self.send_json(500, {"error": str(e)})
+                return
+
+        total = len(item_labels)
+        print(f"[label-scan] {len(entries)} reported, {new_count} new, {changed_count} changed, {total} total known")
+        # one summary line, not one line per item -- a full scan can easily
+        # cover thousands of entries and most runs will mostly be "already known"
+        if new_count or changed_count:
+            append_log("diag", f"Item label scan: {new_count} new, {changed_count} changed, {total} total known labels.")
+        self.send_json(200, {
+            "status": "ok", "received": len(entries),
+            "new": new_count, "changed": changed_count, "total": total,
+        })
+
 # ── main ──────────────────────────────────────────────────────
 if __name__ == "__main__":
     if not check_claude():
@@ -1754,6 +1877,7 @@ if __name__ == "__main__":
     load_recipe_db()
     load_known_patterns()
     load_ore_dict()
+    load_item_labels()
 
     # ThreadingHTTPServer, not plain HTTPServer: handle_upload_recipe_image()
     # blocks on a `claude -p` subprocess for up to 120s (vision extraction is
