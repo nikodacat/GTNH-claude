@@ -377,10 +377,15 @@ local function claimAndStartOneJob()
     if not c.busy then freeCpu = c; break end
   end
   if not freeCpu then
-    dbg("job-poll: no free CPU ("..#cpus.." total, all busy)")
-    post("/report_job_result", {job_id=jobId, success=false,
-      details="no free AE2 crafting CPU right now ("..#cpus.." total, all busy) -- try again later"})
-    cprint(0xFFAA00, "[job] No free AE2 CPU right now -- will need to be requested again later.")
+    -- Only THIS failure mode is auto-retried (server puts the job back to
+    -- "queued" instead of "failed" -- see handle_report_job_result). Every
+    -- other failure branch below stays a one-shot "failed" report, since
+    -- those indicate a real problem (missing pattern, bad component) that
+    -- retrying blindly every 10s would never fix on its own.
+    dbg("job-poll: no free CPU ("..#cpus.." total, all busy) -- will retry")
+    post("/report_job_result", {job_id=jobId, success=false, retryable=true,
+      details="no free AE2 crafting CPU right now ("..#cpus.." total, all busy) -- will retry automatically"})
+    cprint(0xFFAA00, "[job] No free AE2 CPU right now -- will retry automatically.")
     return
   end
 
