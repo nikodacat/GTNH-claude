@@ -993,11 +993,11 @@ About unlabel_machine.py and remove_recipe.py -- fixing mistakes:
 - Neither tool undoes anything automatically or silently -- always tell the player what was removed (the tool's response says how many recipes and which items) so they know what's gone.
 
 About mark_importer.py and sort_pattern.py -- the shared "wildcard" interface:
-- Some setups have ONE physical ME interface set aside as a shared staging spot, where the player can drop a freshly-encoded pattern for ANY machine without needing a dedicated interface per machine. If the player says something like "mark this as the importer" or "this interface can hold any pattern", call mark_importer.py with that interface_address. This interface itself is NOT a real machine and can't craft anything -- it's just a place patterns pass through on their way to being identified.
+- Some setups have ONE physical ME interface set aside purely to import a freshly-encoded pattern to its real, distant machine faster -- NOT to introduce new machines. Every machine the importer could ever route to should already be named (via label_machine.py on its own dedicated interface, or from an earlier importer sort) before a pattern for it shows up here. If the player says something like "mark this as the importer" or "this interface can hold any pattern", call mark_importer.py with that interface_address. This interface itself is NOT a real machine and can't craft anything -- it's just a place patterns pass through on their way to their real machine.
 - Once marked, every new or changed pattern placed on that interface produces its own chat message: "New pattern on the importer interface ...: in: X -> out: Y. Which machine is this for? (sort_id: <id>)" -- this is DIFFERENT from the normal "Found an unidentified machine" prompt (that one is asked once per interface; this one is asked once per PATTERN, since many different patterns pass through the same importer over time).
-- The importer should route patterns to machines that ALREADY exist, not quietly create near-duplicate machine names from typos, different phrasing, or a translation that doesn't exactly match how it was spelled before. So when the player answers, first call sort_pattern.py with that exact sort_id and the machine name they gave -- WITHOUT --confirm. If the response is {"status": "ok", ...}, it matched an existing machine exactly and is already learned, nothing more to do. If instead it's {"status": "needs_confirmation", "did_you_mean": ..., "known_machines": [...]}, do NOT treat it as learned yet: if did_you_mean is a real name, ask the player "did you mean <did_you_mean>?" -- if they confirm, re-call sort_pattern.py with that sort_id, THAT exact suggested name, and --confirm. If they say no (it's genuinely a different/new machine), re-call with their actual name and --confirm. If did_you_mean was null (nothing close), tell the player no existing machine looks like what they said and ask them to double check the name (typo? wrong machine?) before you call again with --confirm to accept it as a new machine anyway.
-- If the player answers in Chinese (or anything other than English) -- expected, some players use a Chinese client -- translate their answer to the machine's standard English/GTNH name yourself before calling sort_pattern.py the first time. The server only does literal string-similarity matching (via difflib), it has no translation ability of its own -- if you pass it untranslated Chinese, it will never find a match against the English names already on record even when the machine genuinely already exists, and will wrongly treat every Chinese answer as a brand new machine. Translating is your job, not the server's.
-- Never guess or reuse a sort_id from a different prompt -- each one is tied to one specific pattern occurrence and can only be answered once it's actually learned (a needs_confirmation response does NOT consume it -- the same sort_id can be resolved by a later, confirmed call)."""
+- When the player answers, call sort_pattern.py with that exact sort_id and the machine name they gave. If the response is {"status": "ok", ...}, it matched an existing machine and is learned -- nothing more to do. If instead it's {"status": "unknown_machine", "did_you_mean": ..., "known_machines": [...]}, it did NOT learn anything (and the sort_id is still usable) -- this always means the name didn't match anything on record, never that it created something new. If did_you_mean looks right, confirm with the player, then call sort_pattern.py again with that sort_id and the EXACT suggested name -- it'll match and learn. If did_you_mean is wrong or null, tell the player none of the known machines matched and show them known_machines so they can give you the exact right name, then call again with that. Never invent a new machine name here or tell the player one was created -- if a pattern genuinely belongs to a machine that has no name yet, that machine needs its own dedicated interface labeled with label_machine.py first, not the importer.
+- If the player answers in Chinese (or anything other than English) -- expected, some players use a Chinese client -- translate their answer to the machine's standard English/GTNH name yourself before calling sort_pattern.py. The server only does literal string-similarity matching (via difflib), it has no translation ability of its own -- if you pass it untranslated Chinese, it will never find a match against the English names already on record even when the machine genuinely already exists, and will wrongly report unknown_machine every time. Translating is your job, not the server's.
+- Never guess or reuse a sort_id from a different prompt -- each one is tied to one specific pattern occurrence and can only be answered once it's actually learned (an unknown_machine response does NOT consume it -- the same sort_id stays usable for a corrected retry)."""
 
 # ── call claude -p ────────────────────────────────────────────
 def ask_claude(messages, system=None):
@@ -2629,23 +2629,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
         twice fails cleanly on the second attempt rather than double-
         learning the recipe.
 
-        The importer is meant to route patterns to machines that already
-        exist elsewhere in the system, not spawn slightly-different-named
-        duplicates of the same machine every time someone phrases it a bit
-        differently (typo, different capitalization, translated-then-
-        retranslated Chinese name, etc.) -- see [[project_gtnh_claude_bridge]]'s
-        "shared wildcard importer interface" section for why. So unless the
-        given `machine` is an exact (case-insensitive) match for an
-        already-known real machine name, OR the caller explicitly sets
-        `confirm: true`, this does NOT learn yet -- it responds with
-        status "needs_confirmation" and a difflib-based best-guess
-        (`did_you_mean`, or null if nothing looks close) and leaves the
-        pending_sorts entry untouched so the same sort_id can be resolved
-        again once Claude has confirmed with the player. `confirm: true`
-        always finalizes under EXACTLY the given `machine` string --
-        Claude is expected to re-call with the corrected/confirmed name
-        (either the suggested existing one, or the player's own if they
-        say it's genuinely new)."""
+        The importer is explicitly NOT a way to introduce a new machine --
+        user's own framing: "importer is just a shallow me interface,
+        where we use to import pattern to distant machine faster, so all
+        the machine we try to import to should already be named." So
+        unlike an earlier version of this endpoint, there is no way to
+        force through an unrecognized name -- `machine` MUST case-
+        insensitively match one of get_known_machine_names() or this
+        does NOT learn. No match at all -> responds with status
+        "unknown_machine" plus a difflib best-guess (`did_you_mean`, or
+        null) and the full `known_machines` list, and leaves the
+        pending_sorts entry untouched so the SAME sort_id can be retried
+        with a corrected name -- no special flag needed, just call again
+        with the right existing name and it'll match exactly."""
         data, err = self._read_json_body()
         if err:
             self.send_json(400, {"error": err})
@@ -2653,7 +2649,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         sort_id = data.get("sort_id")
         machine = data.get("machine")
-        confirm = bool(data.get("confirm"))
         if not sort_id or not machine:
             self.send_json(400, {"error": "missing sort_id or machine"})
             return
@@ -2667,16 +2662,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
         known = get_known_machine_names()
         exact = next((m for m in known if m.lower() == machine.lower()), None)
 
-        if exact is None and not confirm:
-            close = difflib.get_close_matches(machine, known, n=1, cutoff=0.6)
-            did_you_mean = close[0] if close else None
-            print(f"[importer] sort {sort_id}: \"{machine}\" needs confirmation (did_you_mean={did_you_mean})")
-            self.send_json(200, {"status": "needs_confirmation", "sort_id": sort_id,
-                                  "you_said": machine, "did_you_mean": did_you_mean,
-                                  "known_machines": known})
+        if exact is None:
+            close = difflib.get_close_matches(machine, known, n=3, cutoff=0.5)
+            print(f"[importer] sort {sort_id}: \"{machine}\" doesn't match any known machine "
+                  f"(closest: {close[0] if close else 'none'})")
+            self.send_json(200, {"status": "unknown_machine", "sort_id": sort_id,
+                                  "you_said": machine, "did_you_mean": close[0] if close else None,
+                                  "suggestions": close, "known_machines": known})
             return
-
-        final_machine = exact if exact is not None else machine
 
         with pending_sorts_lock:
             entry = pending_sorts.pop(sort_id, None)
@@ -2693,7 +2686,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_json(404, {"error": "unknown or already-resolved sort_id"})
             return
 
-        machine = final_machine
+        machine = exact
         learned_item = save_learned_recipe(machine, entry.get("inputs", []), entry.get("outputs", []))
         in_desc  = ", ".join(describe_item(e) for e in entry.get("inputs", []))  or "(none)"
         out_desc = ", ".join(describe_item(e) for e in entry.get("outputs", [])) or "(none)"
