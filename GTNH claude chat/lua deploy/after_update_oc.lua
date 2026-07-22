@@ -30,7 +30,7 @@
 
 local io = require("io")
 
-local DISK = "/mnt/dc6"
+local DISK = "/home"   -- was /mnt/dc6 (secondary disk mount) -- moved to /home since disk mount labels aren't stable across disk swaps (2026-07-23, T3 disk upgrade)
 
 print("[after-update] hook running...")
 
