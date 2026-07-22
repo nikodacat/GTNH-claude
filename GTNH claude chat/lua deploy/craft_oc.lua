@@ -337,113 +337,121 @@ local function pollActiveCraftJobs()
   end
 end
 
--- Asks the server for the oldest still-queued job (if any) and, if AE2
--- has a free crafting CPU right now, submits it. The CPU check happens
--- HERE -- immediately before submitting -- not when Claude originally
--- queued the job, since availability can change in between (this was an
--- explicit design requirement: check right before executing).
-local function claimAndStartOneJob()
-  local raw, err = get("/next_job")
-  if not raw then
-    dbg("job-poll: /next_job failed: "..(err or "?"))
-    return
-  end
-  if raw:find('"job"%s*:%s*null') then
-    return  -- nothing queued right now
-  end
-
-  local jobId   = extractStr(raw, "id")
-  local jobItem = extractStr(raw, "item")
-  local jobQty  = extractNum(raw, "qty")
-  if not jobId or not jobItem or not jobQty then
-    dbg("job-poll: malformed job response: "..raw:sub(1,200))
-    return
-  end
-
-  cprint(0x00FFFF, "\n[job] Picked up craft job: "..jobQty.."x "..jobItem.." (job "..jobId..")")
-  dbg("job-poll: claimed "..jobId..": "..jobQty.."x "..jobItem)
-
+-- Claims and submits as many queued jobs as there are CURRENTLY FREE AE2
+-- CPUs, once per tick -- previously this claimed at most ONE job per
+-- JOB_POLL_INTERVAL tick even if several CPUs sat idle simultaneously,
+-- throttling a deep backlog to one new job per 10s no matter how much
+-- spare capacity existed. Now: snapshot free CPUs ONCE at the top of the
+-- tick, then walk that list assigning one still-queued job per free CPU
+-- (oldest-first, same FIFO /next_job already enforced) -- so N idle CPUs
+-- can pick up N jobs in the same tick. The CPU check still happens HERE,
+-- immediately before submitting, not when Claude originally queued the
+-- job (explicit design requirement: check right before executing) -- it
+-- just now covers every CPU at once instead of only the first free one.
+--
+-- Because we never claim more jobs than we've already confirmed free
+-- CPUs for, the old "claimed a job, then discovered no CPU was free"
+-- situation can no longer happen here -- the retryable/no-free-CPU path
+-- in handle_report_job_result (server side) is left in place as generic,
+-- harmless infrastructure (still exercised by its own test), just not
+-- reachable from this particular loop anymore.
+local function claimAndStartJobs()
   local okCpus, cpus = pcall(me.getCpus)
   if not okCpus or not cpus then
     dbg("job-poll: getCpus failed: "..tostring(cpus))
-    post("/report_job_result", {job_id=jobId, success=false,
-      details="could not query AE2 CPUs: "..tostring(cpus)})
-    cprint(0xFF4444, "[job] FAILED -- couldn't query AE2 CPUs.")
-    return
+    return  -- nothing claimed yet, nothing to report -- try again next tick
   end
 
-  local freeCpu = nil
+  local freeCpus = {}
   for _, c in ipairs(cpus) do
-    if not c.busy then freeCpu = c; break end
+    if not c.busy then freeCpus[#freeCpus+1] = c end
   end
-  if not freeCpu then
-    -- Only THIS failure mode is auto-retried (server puts the job back to
-    -- "queued" instead of "failed" -- see handle_report_job_result). Every
-    -- other failure branch below stays a one-shot "failed" report, since
-    -- those indicate a real problem (missing pattern, bad component) that
-    -- retrying blindly every 10s would never fix on its own.
-    dbg("job-poll: no free CPU ("..#cpus.." total, all busy) -- will retry")
-    post("/report_job_result", {job_id=jobId, success=false, retryable=true,
-      details="no free AE2 crafting CPU right now ("..#cpus.." total, all busy) -- will retry automatically"})
-    cprint(0xFFAA00, "[job] No free AE2 CPU right now -- will retry automatically.")
-    return
+  if #freeCpus == 0 then
+    return  -- every CPU busy -- queue untouched, no log spam, try again next tick
   end
 
   local okCraftables, craftables = pcall(me.getCraftables)
   if not okCraftables or not craftables then
     dbg("job-poll: getCraftables failed: "..tostring(craftables))
-    post("/report_job_result", {job_id=jobId, success=false,
-      details="could not query AE2 craftables: "..tostring(craftables)})
-    cprint(0xFF4444, "[job] FAILED -- couldn't query AE2 craftables.")
-    return
+    return  -- can't match anything this tick without this list -- try again next tick
   end
 
-  -- NOTE: this file's existing getCraftables() (above) reads `.name`
-  -- directly off each craftable, but the official AECraftable API docs
-  -- only document `.getItemStack()` (which returns a stack with `.name`)
-  -- -- not a bare `.name` field. Unclear which is actually right for
-  -- this GTNH version without a real in-game check, so this tries both:
-  -- direct `.name` first (matching the existing convention elsewhere in
-  -- this file), falling back to `.getItemStack().name` if that's absent.
-  local target = nil
-  for _, c in ipairs(craftables) do
-    local candidateName = c.name
-    if not candidateName then
-      local okStack, stack = pcall(c.getItemStack)
-      if okStack and stack then candidateName = stack.name end
+  for _, freeCpu in ipairs(freeCpus) do
+    local raw, err = get("/next_job")
+    if not raw then
+      dbg("job-poll: /next_job failed: "..(err or "?"))
+      break  -- server hiccup -- stop for this tick, next tick retries
     end
-    if candidateName == jobItem then
-      target = c
+    if raw:find('"job"%s*:%s*null') then
+      break  -- queue is empty -- nothing left to hand to the remaining free CPUs
+    end
+
+    local jobId   = extractStr(raw, "id")
+    local jobItem = extractStr(raw, "item")
+    local jobQty  = extractNum(raw, "qty")
+    if not jobId or not jobItem or not jobQty then
+      dbg("job-poll: malformed job response: "..raw:sub(1,200))
       break
     end
-  end
-  if not target then
-    dbg("job-poll: no craftable pattern found for "..jobItem)
-    post("/report_job_result", {job_id=jobId, success=false,
-      details="no AE2 craftable pattern found for "..jobItem.." -- is a pattern encoded for it?"})
-    cprint(0xFF4444, "[job] FAILED -- no craftable pattern found for "..jobItem..".")
-    return
-  end
 
-  local okReq, craftJob = pcall(target.request, jobQty, false, freeCpu.name)
-  if not okReq or not craftJob then
-    dbg("job-poll: request() failed: "..tostring(craftJob))
-    post("/report_job_result", {job_id=jobId, success=false,
-      details="AE2 request() call failed: "..tostring(craftJob)})
-    cprint(0xFF4444, "[job] FAILED -- AE2 request() call errored.")
-    return
-  end
+    cprint(0x00FFFF, "\n[job] Picked up craft job: "..jobQty.."x "..jobItem.." (job "..jobId..") -> cpu "..freeCpu.name)
+    dbg("job-poll: claimed "..jobId..": "..jobQty.."x "..jobItem.." -> cpu "..freeCpu.name)
 
-  activeCraftJobs[jobId] = {craftJob=craftJob, item=jobItem, qty=jobQty, cpuName=freeCpu.name}
-  dbg("job-poll: "..jobId.." submitted on cpu "..freeCpu.name)
-  cprint(0x888888, "[job] Submitted on CPU '"..freeCpu.name.."' -- will report back once it finishes.")
+    -- NOTE: this file's existing getCraftables() (above) reads `.name`
+    -- directly off each craftable, but the official AECraftable API docs
+    -- only document `.getItemStack()` (which returns a stack with `.name`)
+    -- -- not a bare `.name` field. Unclear which is actually right for
+    -- this GTNH version without a real in-game check, so this tries both:
+    -- direct `.name` first (matching the existing convention elsewhere in
+    -- this file), falling back to `.getItemStack().name` if that's absent.
+    local target = nil
+    for _, c in ipairs(craftables) do
+      local candidateName = c.name
+      if not candidateName then
+        local okStack, stack = pcall(c.getItemStack)
+        if okStack and stack then candidateName = stack.name end
+      end
+      if candidateName == jobItem then
+        target = c
+        break
+      end
+    end
+    if not target then
+      dbg("job-poll: no craftable pattern found for "..jobItem)
+      post("/report_job_result", {job_id=jobId, success=false,
+        details="no AE2 craftable pattern found for "..jobItem.." -- is a pattern encoded for it?"})
+      cprint(0xFF4444, "[job] FAILED -- no craftable pattern found for "..jobItem..".")
+      -- this CPU slot goes unused this tick (deliberately simple: move on
+      -- to the NEXT free cpu / next queued job rather than retrying this
+      -- same slot against another job -- the skipped job will just be
+      -- picked up on a later free-cpu slot, this tick or a later one)
+      goto continue_loop
+    end
+
+    do
+      local okReq, craftJob = pcall(target.request, jobQty, false, freeCpu.name)
+      if not okReq or not craftJob then
+        dbg("job-poll: request() failed: "..tostring(craftJob))
+        post("/report_job_result", {job_id=jobId, success=false,
+          details="AE2 request() call failed: "..tostring(craftJob)})
+        cprint(0xFF4444, "[job] FAILED -- AE2 request() call errored.")
+        goto continue_loop
+      end
+
+      activeCraftJobs[jobId] = {craftJob=craftJob, item=jobItem, qty=jobQty, cpuName=freeCpu.name}
+      dbg("job-poll: "..jobId.." submitted on cpu "..freeCpu.name)
+      cprint(0x888888, "[job] Submitted on CPU '"..freeCpu.name.."' -- will report back once it finishes.")
+    end
+
+    ::continue_loop::
+  end
 end
 
 local function jobPollTick()
   local ok1, e1 = pcall(pollActiveCraftJobs)
   if not ok1 then dbg("pollActiveCraftJobs errored: "..tostring(e1)) end
-  local ok2, e2 = pcall(claimAndStartOneJob)
-  if not ok2 then dbg("claimAndStartOneJob errored: "..tostring(e2)) end
+  local ok2, e2 = pcall(claimAndStartJobs)
+  if not ok2 then dbg("claimAndStartJobs errored: "..tostring(e2)) end
 end
 
 -- ── recipe lookup ─────────────────────────────
