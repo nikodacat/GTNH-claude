@@ -43,6 +43,18 @@ PORT       = 11434
 CLAUDE_PATH = os.environ.get("CLAUDE_CLI_PATH", "claude")
 CRAFT_TOOL_TIMEOUT_S = 180  # see ask_claude()'s comment for why this isn't 90 anymore
 
+# Debug log for the underlying `claude -p` subprocess -- overwritten on every
+# call (not per-call unique) so there's always exactly one file to check.
+# `--debug-file` implicitly turns on Claude Code's debug logging, which
+# records the REAL detail of what each tool call actually did (the exact
+# command run, its real exit code/output, and any permission decision) --
+# unlike the model's own final reply text, which has repeatedly turned out to
+# be an unreliable paraphrase of what really happened (see the exit-code-49
+# saga in project memory). If something looks wrong again, check this file
+# for ground truth instead of trusting the in-game assistant's explanation.
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+CLAUDE_DEBUG_LOG = os.path.join(BASE_DIR, "claude_debug_last.log")
+
 # ── shared conversation log ───────────────────────────────────
 # Each entry: { "role": "player"|"claude"|"error", "text": str, "time": str }
 # Persisted to CHAT_LOG_PATH (JSONL -- one JSON object per line, append-
@@ -742,7 +754,7 @@ def ask_claude_vision(image_abs_path):
               + image_abs_path)
     try:
         result = subprocess.run(
-            [CLAUDE_PATH, "-p", prompt, "--permission-mode", "bypassPermissions", "--allowedTools", "Read"],
+            [CLAUDE_PATH, "-p", prompt, "--permission-mode", "bypassPermissions", "--debug-file", CLAUDE_DEBUG_LOG, "--allowedTools", "Read"],
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -873,7 +885,7 @@ def ask_claude(messages, system=None):
     start = time.monotonic()
     try:
         result = subprocess.run(
-            [CLAUDE_PATH, "-p", prompt, "--permission-mode", "bypassPermissions", "--allowedTools"] + allowed_tools,
+            [CLAUDE_PATH, "-p", prompt, "--permission-mode", "bypassPermissions", "--debug-file", CLAUDE_DEBUG_LOG, "--allowedTools"] + allowed_tools,
             capture_output=True,
             text=True,
             encoding="utf-8",
