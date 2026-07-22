@@ -7,12 +7,16 @@
       "Bash(python tools/request_craft.py:*)",
       "Bash(python tools/label_machine.py:*)",
       "Bash(python tools/request_scan.py:*)",
+      "Bash(python tools/unlabel_machine.py:*)",
+      "Bash(python tools/remove_recipe.py:*)",
       "Bash(python3 tools/resolve_item.py:*)",
       "Bash(python3 tools/get_recipe.py:*)",
       "Bash(python3 tools/craft_plan.py:*)",
       "Bash(python3 tools/request_craft.py:*)",
       "Bash(python3 tools/label_machine.py:*)",
       "Bash(python3 tools/request_scan.py:*)",
+      "Bash(python3 tools/unlabel_machine.py:*)",
+      "Bash(python3 tools/remove_recipe.py:*)",
       "Read"
     ]
   },
