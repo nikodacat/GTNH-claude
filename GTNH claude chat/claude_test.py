@@ -813,12 +813,14 @@ def check_claude():
 # thin wrapper around an existing server endpoint, so there's exactly
 # one implementation of each lookup no matter who calls it.
 CRAFT_TOOLS_SYSTEM = """You have access to six command-line tools (run them with your Bash tool, exactly as shown -- nothing else is permitted):
-  python3 tools/resolve_item.py <name>              -- resolve an item name/label (English or otherwise -- translate it yourself first if needed) to candidate item ids
-  python3 tools/get_recipe.py <item_id>              -- look up recipe_db.json recipes for an exact item id
-  python3 tools/craft_plan.py <item_id> [qty]        -- get the static craft-tree plan for item+qty
-  python3 tools/request_craft.py <item_id> <qty>     -- QUEUE a craft request (does NOT execute it -- see below)
-  python3 tools/label_machine.py <interface_address> <machine name> -- label a not-yet-identified machine (see below)
-  python3 tools/request_scan.py                     -- QUEUE a full ME-interface pattern scan (does NOT run it instantly -- see below)
+  python tools/resolve_item.py <name>              -- resolve an item name/label (English or otherwise -- translate it yourself first if needed) to candidate item ids
+  python tools/get_recipe.py <item_id>              -- look up recipe_db.json recipes for an exact item id
+  python tools/craft_plan.py <item_id> [qty]        -- get the static craft-tree plan for item+qty
+  python tools/request_craft.py <item_id> <qty>     -- QUEUE a craft request (does NOT execute it -- see below)
+  python tools/label_machine.py <interface_address> <machine name> -- label a not-yet-identified machine (see below)
+  python tools/request_scan.py                     -- QUEUE a full ME-interface pattern scan (does NOT run it instantly -- see below)
+
+IMPORTANT: always run these with `python`, never `python3`. On this machine, `python3` resolves to a broken Windows Store redirect stub that silently exits with no output whenever it's run non-interactively -- it will look like the tool did nothing, with no error to explain why. `python` is the one that actually works.
 
 Important limits on request_craft.py, since this is easy to get wrong:
 - It only adds the job to a queue. Only the physical OC computer in-game can actually touch AE2 (check a free crafting CPU, submit the request) -- it picks up queued jobs on its own background schedule, not instantly. Tell the player it's QUEUED, never that it's done.
@@ -845,11 +847,15 @@ def ask_claude(messages, system=None):
     parts.append("[Assistant]\n(reply below)")
     prompt = "\n\n".join(parts)
 
-    # Scoped to exactly these 4 scripts -- Claude cannot run arbitrary Bash
+    # Scoped to exactly these 6 scripts -- Claude cannot run arbitrary Bash
     # commands, only these specific invocations. Both "python3" and
-    # "python" prefixes are allowed since which one resolves depends on
-    # the player's own PC setup (this server has no way to verify that
-    # from here).
+    # "python" prefixes are allowlisted, but CRAFT_TOOLS_SYSTEM above tells
+    # Claude to always use "python": on this Windows deployment "python3"
+    # resolves to a Windows App Execution Alias stub (Store redirect) that
+    # silently exits code 49 with no output when run non-interactively --
+    # see anthropics/claude-code#57946. Keeping the "python3" allowlist
+    # entries around is harmless (they're just never used in practice) in
+    # case a future machine's PATH ordering differs.
     craft_tool_scripts = ["resolve_item.py", "get_recipe.py", "craft_plan.py", "request_craft.py", "label_machine.py", "request_scan.py"]
     allowed_tools = []
     for script in craft_tool_scripts:
