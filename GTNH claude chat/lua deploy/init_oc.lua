@@ -35,9 +35,12 @@ local REPO_RAW  = "https://raw.githubusercontent.com/nikodacat/GTNH-claude/main/
 -- Keep this in sync with update_oc.lua's ROLE_FILES table -- the
 -- descriptions here are just for the player choosing at the prompt,
 -- update_oc.lua is the one place that actually decides what gets fetched.
+-- `main` is this role's long-running script (bare on-disk name, no .lua)
+-- -- it's what .shrc auto-launches after update_oc on every boot, and it
+-- lives on DISK, same as every other role-specific script.
 local ROLES = {
-  { key = "craft", label = "craft -- crafting dispatch + status/search terminal (runs craft_oc.lua)" },
-  { key = "scan",  label = "scan  -- ME interface pattern scanner, background poller (runs scan_patterns_oc.lua)" },
+  { key = "craft", main = "craft_oc",        label = "craft -- crafting dispatch + status/search terminal (runs craft_oc.lua)" },
+  { key = "scan",  main = "scan_patterns_oc", label = "scan  -- ME interface pattern scanner, background poller (runs scan_patterns_oc.lua)" },
 }
 
 local function readCurrentRole()
@@ -150,4 +153,57 @@ if not ok then
   print("[FAIL] update_oc errored: "..tostring(runErr))
   print("       You can run it again manually: "..updatePath)
 end
+
+-- ── auto-start on boot: write /home/.shrc ──────
+-- OpenOS sources /home/.shrc from /etc/profile.lua every time a shell
+-- loads (normally once at boot) -- each line runs as if typed at the
+-- prompt. Absolute paths, not bare names, since DISK ("/mnt/dc6") isn't
+-- necessarily on the shell's PATH -- this way it doesn't matter either
+-- way. Written regardless of whether TODAY's update_oc run above
+-- succeeded -- this is about every FUTURE boot, not just this run, and a
+-- transient network hiccup right now shouldn't stop boot-autostart from
+-- being set up for later.
+--
+-- Note (OpenOS behavior, not a bug here): .shrc runs every time a shell
+-- loads, which can be more than once per boot if a second terminal/shell
+-- is opened -- both update_oc and the role's main script tolerate being
+-- re-run (they redo their own hardware/log checks each time), so this
+-- isn't harmful, just worth knowing.
+local SHRC_PATH = HOME.."/.shrc"
+local desiredShrc = updatePath.."\n"..DISK.."/"..picked.main.."\n"
+
+local existingShrc = nil
+local rf = io.open(SHRC_PATH, "r")
+if rf then
+  existingShrc = rf:read("*a")
+  rf:close()
+end
+
+if existingShrc == desiredShrc then
+  print("")
+  print("[i] "..SHRC_PATH.." already set up correctly for this role -- left as-is.")
+else
+  if existingShrc and existingShrc ~= "" then
+    print("")
+    print("[!] "..SHRC_PATH.." already existed with different content -- overwriting.")
+    print("    Previous contents:")
+    print("    ----")
+    for line in (existingShrc.."\n"):gmatch("(.-)\n") do
+      print("    "..line)
+    end
+    print("    ----")
+  end
+  local sf, sferr = io.open(SHRC_PATH, "w")
+  if not sf then
+    print("[FAIL] couldn't write "..SHRC_PATH..": "..tostring(sferr))
+  else
+    sf:write(desiredShrc)
+    sf:close()
+    print("")
+    print("[OK] "..SHRC_PATH.." written -- on every future boot this computer will run:")
+    print("       "..updatePath)
+    print("       "..DISK.."/"..picked.main)
+  end
+end
+
 io.read()
