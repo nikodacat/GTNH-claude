@@ -38,6 +38,7 @@ import math
 
 PORT       = 11434
 CLAUDE_PATH = os.environ.get("CLAUDE_CLI_PATH", "claude")
+CRAFT_TOOL_TIMEOUT_S = 180  # see ask_claude()'s comment for why this isn't 90 anymore
 
 # ── shared conversation log ───────────────────────────────────
 # Each entry: { "role": "player"|"claude"|"error", "text": str, "time": str }
@@ -815,6 +816,15 @@ def ask_claude(messages, system=None):
         allowed_tools.append(f"Bash(python3 tools/{script}:*)")
         allowed_tools.append(f"Bash(python tools/{script}:*)")
 
+    # A request that resolves an item, checks recipes, plans a craft tree,
+    # AND queues it can chain up to 5 separate tool calls -- each one is a
+    # full subprocess + localhost HTTP round trip, plus the model's own
+    # reasoning time between steps. 90s turned out to be too tight for a
+    # request like that (observed timing out in real use, not just
+    # theoretical) -- raised to 180s. CRAFT_TOOL_TIMEOUT_S is a single
+    # named constant so this doesn't need to be hunted down again if it
+    # ever needs adjusting a second time.
+    start = time.monotonic()
     try:
         result = subprocess.run(
             [CLAUDE_PATH, "-p", prompt, "--allowedTools"] + allowed_tools,
@@ -822,14 +832,15 @@ def ask_claude(messages, system=None):
             text=True,
             encoding="utf-8",
             errors="replace",
-            timeout=90  # a bit higher than before -- tool calls (subprocess + HTTP round trip) add latency
+            timeout=CRAFT_TOOL_TIMEOUT_S,
         )
         if result.returncode != 0:
             err = result.stderr.strip() or "unknown error"
             return None, f"claude exited {result.returncode}: {err}"
         return result.stdout.strip(), None
     except subprocess.TimeoutExpired:
-        return None, "claude timed out (>90s)"
+        elapsed = time.monotonic() - start
+        return None, f"claude timed out (>{CRAFT_TOOL_TIMEOUT_S}s, ran {elapsed:.0f}s) -- try again, or ask a simpler/more specific question"
     except Exception as e:
         return None, str(e)
 
