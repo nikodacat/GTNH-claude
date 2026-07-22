@@ -68,7 +68,7 @@
 local component = require("component")
 local computer  = require("computer")
 
-local DISK = "/mnt/dc6"   -- where scripts + config live
+local DISK = "/home"   -- where scripts + config live (was /mnt/dc6 -- moved to /home, stable across disk swaps)
 
 if not component.isAvailable("internet") then print("[FAIL] no internet card"); return end
 
