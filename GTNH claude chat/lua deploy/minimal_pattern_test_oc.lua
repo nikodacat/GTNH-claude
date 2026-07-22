@@ -67,23 +67,13 @@
 --  has zero bearing on whether the pattern validates. This
 --  version writes 2 sticks (GTNH's real ratio) instead of
 --  vanilla's 4, purely for display accuracy.
---
---  v4 (this version): the previous run showed [FAIL] with
---  the corrected 2-slot arrangement AND a fresh pattern, so
---  something deeper is going on than the two bugs already
---  fixed. Added diagnostic checkpoints BEFORE clearing,
---  and BEFORE writing output, and logs every individual
---  clear call's result instead of silently discarding it --
---  so we can see exactly which step first diverges from
---  expected behavior, rather than guessing further from
---  static source reading alone.
 -- =============================================
 
 local component = require("component")
 local computer   = require("computer")
 local io         = require("io")
 
-local DISK = "/mnt/dc6"
+local DISK = "/home"   -- was /mnt/dc6 -- moved to /home, stable across disk swaps
 local SCRIPT_NAME = "minimal_pattern_test_oc"
 
 -- optional web logging, best-effort (same pattern as diag_oc.lua) --
@@ -135,7 +125,7 @@ local editor = component.oc_pattern_editor
 local db = component.database
 local SLOT = 1
 
-dbg("=== Minimal Pattern Test v4: 2 planks -> 2 sticks (GTNH ratio) ===")
+dbg("=== Minimal Pattern Test v3: 2 planks -> 2 sticks (GTNH ratio) ===")
 dbg("If this still fails, the pattern item itself is likely poisoned")
 dbg("from an earlier failed attempt -- try a completely FRESH one.")
 
