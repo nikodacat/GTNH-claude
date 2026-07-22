@@ -31,8 +31,25 @@ local FILES = {
   "diag_pattern_editor_oc",
   "minimal_pattern_test_oc",
   "scan_patterns_oc",
+  "after_update_oc",
   "config.example",
   "update_oc",
+}
+
+-- ── after-update hooks ─────────────────────────
+-- Base names (must also appear in FILES above, so they get fetched to
+-- disk like everything else) that get dofile()'d automatically right
+-- after every update pass finishes -- see the "run after-update hooks"
+-- section near the bottom of this file. This is the extension point for
+-- one-time migration/fixup logic that needs to run whenever scripts
+-- change (e.g. after this same script updates ITSELF to a newer
+-- version): put that logic in one of these files instead of editing
+-- update_oc.lua's own core loop again. Since these hook files are pulled
+-- from GitHub exactly like everything else, what runs post-update can be
+-- changed at any time just by editing the hook script on GitHub -- this
+-- list only needs a new entry the first time a given hook file is added.
+local AFTER_UPDATE = {
+  "after_update_oc",
 }
 
 -- files that live in HOME instead of DISK (update_oc itself lives at
@@ -158,6 +175,7 @@ dbg("Source: " .. REPO_RAW)
 dbg("")
 
 local okCount, failCount = 0, 0
+local fetchedOk = {}   -- base name -> true if this run's fetch+write succeeded
 for _, base in ipairs(FILES) do
   local name = base .. ".lua"
   io.write("  " .. name .. " ... ")
@@ -182,6 +200,7 @@ for _, base in ipairs(FILES) do
       print(msg)
       debugLines[#debugLines+1] = "  " .. name .. " ... " .. msg
       okCount = okCount + 1
+      fetchedOk[base] = true
     end
   end
 end
@@ -202,4 +221,36 @@ else
   dbg("    " .. DISK .. "/config.lua and set your SERVER ip")
   dbg("    before running craft_oc.lua / claude_chat_oc.lua.")
 end
+
+-- ── run after-update hooks ─────────────────────
+-- Runs every entry in AFTER_UPDATE, in order, regardless of whether this
+-- specific run re-fetched it (an already-up-to-date file from a prior
+-- run is still run) -- only a totally MISSING file (never fetched
+-- successfully, ever) is skipped. Each hook is dofile()'d inside its own
+-- pcall so one hook throwing an error can't stop the rest from running,
+-- or crash update_oc.lua itself right when it's most likely to matter
+-- (e.g. update_oc.lua having just updated ITSELF to a version that
+-- depends on a hook doing some one-time setup).
+dbg("")
+dbg("=== Running after-update hooks ===")
+for _, base in ipairs(AFTER_UPDATE) do
+  local path = targetPath(base)
+  local f = io.open(path, "r")
+  if not f then
+    local msg = "  [SKIP] " .. base .. " -- not found on disk (fetch above may have failed, and no prior copy exists either)"
+    print(msg)
+    debugLines[#debugLines+1] = msg
+  else
+    f:close()
+    local tag = fetchedOk[base] and "" or " (using existing on-disk copy -- not re-fetched this run)"
+    dbg("  running " .. base .. "..." .. tag)
+    local ok, hookErr = pcall(dofile, path)
+    if ok then
+      dbg("  [OK] " .. base .. " completed")
+    else
+      dbg("  [FAIL] " .. base .. " errored: " .. tostring(hookErr))
+    end
+  end
+end
+
 flushDebug("update-"..(failCount==0 and "success" or "partial-fail"))
