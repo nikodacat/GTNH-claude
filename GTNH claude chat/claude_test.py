@@ -33,13 +33,46 @@ CLAUDE_PATH = os.environ.get("CLAUDE_CLI_PATH", "claude")
 
 # ── shared conversation log ───────────────────────────────────
 # Each entry: { "role": "player"|"claude"|"error", "text": str, "time": str }
+# Persisted to CHAT_LOG_PATH (JSONL -- one JSON object per line, append-
+# only) so restarting the server doesn't lose history: previous messages
+# AND diag/error log entries (the dedicated /logs viewer reads from this
+# same chat_log, just filtered client-side) are both reloaded on startup.
+CHAT_LOG_PATH = "chat_log.jsonl"
 log_lock   = threading.Lock()
 chat_log   = []
 
+def load_chat_log():
+    global chat_log
+    if not os.path.exists(CHAT_LOG_PATH):
+        print(f"[~] {CHAT_LOG_PATH} not found -- starting with an empty chat log.")
+        return
+    print(f"[~] Loading chat log...", end=" ", flush=True)
+    loaded = []
+    with open(CHAT_LOG_PATH, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                loaded.append(json.loads(line))
+            except Exception:
+                # tolerate a corrupted trailing line (e.g. a hard crash
+                # mid-write) rather than losing the whole log over one bad line
+                pass
+    with log_lock:
+        chat_log[:] = loaded
+    print(f"done. {len(chat_log):,} entries loaded.")
+
 def append_log(role, text):
     ts = time.strftime("%H:%M:%S")
+    entry = {"role": role, "text": text, "time": ts}
     with log_lock:
-        chat_log.append({"role": role, "text": text, "time": ts})
+        chat_log.append(entry)
+        try:
+            with open(CHAT_LOG_PATH, "a", encoding="utf-8") as f:
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        except Exception as e:
+            print(f"[warn] failed to persist chat log entry to {CHAT_LOG_PATH}: {e}")
 
 # ── CJK detection ─────────────────────────────────────────────
 def contains_cjk(text):
@@ -500,6 +533,15 @@ WEB_PAGE = """<!DOCTYPE html>
   <button id="sendBtn">Send</button>
 </div>
 <script>
+  // Recipe-from-image upload is hidden/disabled for now (kept in the code,
+  // not deleted, in case it's wanted again later) -- flip this back to
+  // true to fully restore the browse/drag/paste upload bar and its paste
+  // listener with no other changes needed.
+  const RECIPE_IMAGE_UPLOAD_ENABLED = false;
+  if (!RECIPE_IMAGE_UPLOAD_ENABLED) {
+    document.getElementById('uploadBar').style.display = 'none';
+  }
+
   let lastCount = 0;
 
   function addMessage(entry) {
@@ -795,6 +837,7 @@ WEB_PAGE = """<!DOCTYPE html>
   // image -- otherwise falls through to normal text pasting (e.g. into
   // chatInput or recipeNoteInput) untouched.
   document.addEventListener('paste', (e) => {
+    if (!RECIPE_IMAGE_UPLOAD_ENABLED) return;
     const items = e.clipboardData && e.clipboardData.items;
     if (!items) return;
     for (const item of items) {
@@ -1421,6 +1464,7 @@ if __name__ == "__main__":
     if not check_claude():
         sys.exit(1)
 
+    load_chat_log()
     load_recipe_db()
     load_known_patterns()
     load_ore_dict()
