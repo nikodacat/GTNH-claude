@@ -22,6 +22,9 @@
 #    GET  /next_job             -- OC's background poll: claim the oldest queued craft job
 #    POST /report_job_result    -- OC reports a claimed job's outcome (success/failure + details)
 #    POST /label_machine        -- Claude (via tools/label_machine.py) labels an unlabeled machine
+#    POST /request_scan         -- Claude (via tools/request_scan.py) queues a ME-interface pattern scan
+#    GET  /next_scan            -- scanning OC computer's background poll: claim the oldest queued scan request
+#    POST /report_scan_result   -- scanning OC computer reports a claimed scan's outcome
 # =============================================
 
 import http.server
@@ -360,6 +363,36 @@ def save_pending_jobs():
     with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(pending_jobs, f, ensure_ascii=False, indent=2)
     os.replace(tmp_path, PENDING_JOBS_PATH)
+
+
+# ── ME-interface pattern SCAN request queue (pending_scans.json) ───────
+# A separate queue from pending_jobs above -- user's explicit call: a scan
+# request and a craft job are different shapes of thing (a scan takes no
+# item/qty, just "go scan"), so don't force them through the same queue.
+# Runs on a SECOND, dedicated OC computer (the one running
+# scan_patterns_oc.lua, which owns the Database Upgrade + me_interface
+# wiring needed to read pattern contents) -- that computer polls
+# GET /next_scan on its own background loop, same shape as craft_oc.lua's
+# job-poll timer but on a separate machine, separate queue, separate file.
+PENDING_SCANS_PATH = "pending_scans.json"
+pending_scans = {}   # scan_id -> {id, status, requested_at, result}
+pending_scans_lock = threading.Lock()
+
+def load_pending_scans():
+    global pending_scans
+    if not os.path.exists(PENDING_SCANS_PATH):
+        print(f"[~] {PENDING_SCANS_PATH} not found -- starting with an empty scan queue.")
+        return
+    with open(PENDING_SCANS_PATH, "r", encoding="utf-8") as f:
+        pending_scans = json.load(f)
+    print(f"[~] Loaded pending_scans.json: {len(pending_scans):,} scan request(s) on record.")
+
+def save_pending_scans():
+    """Write pending_scans back to disk. Caller must hold pending_scans_lock."""
+    tmp_path = PENDING_SCANS_PATH + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(pending_scans, f, ensure_ascii=False, indent=2)
+    os.replace(tmp_path, PENDING_SCANS_PATH)
 
 
 # ── machine identity tracking (interface_meta.json) ────────────────────
@@ -779,18 +812,25 @@ def check_claude():
 # their own context. See tools/*.py for the actual scripts -- each is a
 # thin wrapper around an existing server endpoint, so there's exactly
 # one implementation of each lookup no matter who calls it.
-CRAFT_TOOLS_SYSTEM = """You have access to five command-line tools (run them with your Bash tool, exactly as shown -- nothing else is permitted):
+CRAFT_TOOLS_SYSTEM = """You have access to six command-line tools (run them with your Bash tool, exactly as shown -- nothing else is permitted):
   python3 tools/resolve_item.py <name>              -- resolve an item name/label (English or otherwise -- translate it yourself first if needed) to candidate item ids
   python3 tools/get_recipe.py <item_id>              -- look up recipe_db.json recipes for an exact item id
   python3 tools/craft_plan.py <item_id> [qty]        -- get the static craft-tree plan for item+qty
   python3 tools/request_craft.py <item_id> <qty>     -- QUEUE a craft request (does NOT execute it -- see below)
   python3 tools/label_machine.py <interface_address> <machine name> -- label a not-yet-identified machine (see below)
+  python3 tools/request_scan.py                     -- QUEUE a full ME-interface pattern scan (does NOT run it instantly -- see below)
 
 Important limits on request_craft.py, since this is easy to get wrong:
 - It only adds the job to a queue. Only the physical OC computer in-game can actually touch AE2 (check a free crafting CPU, submit the request) -- it picks up queued jobs on its own background schedule, not instantly. Tell the player it's QUEUED, never that it's done.
 - Completion is reported separately later, as its own chat message, once the OC side finishes the job -- you will not see that result in this same turn.
 - If craft_plan.py or request_craft.py returns a non-empty "needs_player_input", that means a real recipe ambiguity or dependency loop the planner can't resolve alone -- explain the options to the player and ask them to choose. Do not call request_craft.py again for that item until they do, and do not guess.
 - Only use request_craft.py when the player has actually asked for something to be crafted -- use craft_plan.py/get_recipe.py/resolve_item.py freely just to answer questions, without queuing anything.
+
+Important limits on request_scan.py, similar shape to request_craft.py:
+- This is a SEPARATE queue from crafting, and runs on a SEPARATE, dedicated OC computer (the one wired to the Database Upgrade + me_interfaces needed to read pattern contents) -- it picks the request up on its own background poll, not instantly. Tell the player the scan is QUEUED, never that it's done.
+- Completion (or failure -- e.g. missing hardware on that computer) is reported separately later as its own chat message, once that computer finishes -- you will not see the result in this same turn.
+- Use this when the player asks you to check for new/changed machine patterns (e.g. "did you see my new machine yet?", "rescan"). This is unrelated to item-label scanning (the "scan_labels" OC terminal command) -- that's a different feature entirely, not something you can trigger via a tool.
+- If an unlabeled machine turns up from a scan, you'll see it as a chat message ("Found an unidentified machine...") the same way as before -- ask the player what it is and use label_machine.py, same as always.
 
 About label_machine.py: when a machine's ME interface has never been identified yet, a scan reports it and you'll see a chat message like "Found an unidentified machine -- interface \"<label>\" (address <addr>). What machine is this?" -- that message (earlier in this same conversation) contains the exact interface_address to use. When the player answers (e.g. "that one's the Circuit Assembler"), call label_machine.py with that same interface_address and the name they gave. Never invent or guess an interface_address that wasn't given to you in an actual scan message."""
 
@@ -810,7 +850,7 @@ def ask_claude(messages, system=None):
     # "python" prefixes are allowed since which one resolves depends on
     # the player's own PC setup (this server has no way to verify that
     # from here).
-    craft_tool_scripts = ["resolve_item.py", "get_recipe.py", "craft_plan.py", "request_craft.py", "label_machine.py"]
+    craft_tool_scripts = ["resolve_item.py", "get_recipe.py", "craft_plan.py", "request_craft.py", "label_machine.py", "request_scan.py"]
     allowed_tools = []
     for script in craft_tool_scripts:
         allowed_tools.append(f"Bash(python3 tools/{script}:*)")
@@ -1719,6 +1759,25 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         print(f"[craft-job][err] failed to save pending_jobs.json: {e}")
                     self.send_json(200, {"job": job})
 
+        elif self.path.startswith("/next_scan"):
+            # The dedicated scanning OC computer's background poll (see
+            # scan_patterns_oc.lua) -- claims the oldest still-queued scan
+            # request, if any, same claim-then-mark-in_progress shape as
+            # /next_job above but a completely separate queue/file.
+            with pending_scans_lock:
+                candidates = [s for s in pending_scans.values() if s.get("status") == "queued"]
+                candidates.sort(key=lambda s: s.get("requested_at", ""))
+                if not candidates:
+                    self.send_json(200, {"scan": None})
+                else:
+                    scan = candidates[0]
+                    scan["status"] = "in_progress"
+                    try:
+                        save_pending_scans()
+                    except Exception as e:
+                        print(f"[scan-job][err] failed to save pending_scans.json: {e}")
+                    self.send_json(200, {"scan": scan})
+
         else:
             self.send_json(404, {"error": "not found"})
 
@@ -1778,6 +1837,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         if self.path == "/label_machine":
             self.handle_label_machine()
+            return
+
+        if self.path == "/request_scan":
+            self.handle_request_scan()
+            return
+
+        if self.path == "/report_scan_result":
+            self.handle_report_scan_result()
             return
 
         if self.path != "/chat":
@@ -2358,6 +2425,70 @@ class Handler(http.server.BaseHTTPRequestHandler):
             append_log("claude", msg)
         self.send_json(200, {"status": "ok"})
 
+    # ── ME-interface pattern scan request queue ──────────────────
+    def handle_request_scan(self):
+        """Called by tools/request_scan.py, which Claude invokes when the
+        player asks to scan for new/changed machine patterns. Queues a
+        scan request -- a SEPARATE queue from pending_jobs (crafting), and
+        runs on a SEPARATE, dedicated OC computer (the one wired up for
+        scan_patterns_oc.lua, since that's the one with the Database
+        Upgrade + me_interface access this scan needs). No item/qty here,
+        a scan request is just "go scan everything"."""
+        # accept an empty body (no fields are actually required) without
+        # treating it as an error -- Claude may call this with no args
+        length = int(self.headers.get("Content-Length", 0))
+        if length:
+            self.rfile.read(length)
+
+        scan_id = uuid.uuid4().hex[:10]
+        now = time.strftime("%Y-%m-%d %H:%M:%S")
+        with pending_scans_lock:
+            pending_scans[scan_id] = {
+                "id": scan_id, "status": "queued", "requested_at": now, "result": None,
+            }
+            try:
+                save_pending_scans()
+            except Exception as e:
+                print(f"[scan-job][err] failed to save pending_scans.json: {e}")
+                append_log("error", f"failed to save pending_scans.json: {e}")
+
+        append_log("diag", f"Pattern scan queued (scan {scan_id}) -- waiting for the scanning computer to pick it up.")
+        self.send_json(200, {"queued": True, "scan_id": scan_id})
+
+    def handle_report_scan_result(self):
+        """The scanning OC computer reports the outcome of a scan it
+        claimed via GET /next_scan. Unlike craft jobs there's no
+        retryable/CPU-busy concept here -- a scan either ran or it
+        didn't -- so this is intentionally simpler than
+        handle_report_job_result above."""
+        data, err = self._read_json_body()
+        if err:
+            self.send_json(400, {"error": err})
+            return
+
+        scan_id = data.get("scan_id")
+        success = bool(data.get("success", False))
+        details = data.get("details", "")
+
+        with pending_scans_lock:
+            scan = pending_scans.get(scan_id)
+            if not scan:
+                self.send_json(404, {"error": "unknown scan_id"})
+                return
+            scan["status"] = "done" if success else "failed"
+            scan["result"] = details
+            try:
+                save_pending_scans()
+            except Exception as e:
+                print(f"[scan-job][err] failed to save pending_scans.json: {e}")
+                append_log("error", f"failed to save pending_scans.json: {e}")
+
+        verb = "complete" if success else "FAILED"
+        msg = f"Pattern scan {scan_id} {verb}: {details}" if details else f"Pattern scan {scan_id} {verb}."
+        print(f"[scan-job] {msg}")
+        append_log("claude", msg)
+        self.send_json(200, {"status": "ok"})
+
 # ── main ──────────────────────────────────────────────────────
 if __name__ == "__main__":
     if not check_claude():
@@ -2369,6 +2500,7 @@ if __name__ == "__main__":
     load_ore_dict()
     load_item_labels()
     load_pending_jobs()
+    load_pending_scans()
     load_interface_meta()
 
     # ThreadingHTTPServer, not plain HTTPServer: handle_upload_recipe_image()
