@@ -20,7 +20,7 @@
 local component = require("component")
 local computer  = require("computer")
 
-local DISK = "/mnt/dc6"
+local DISK = "/home"   -- was /mnt/dc6 -- moved to /home, stable across disk swaps
 local SCRIPT_NAME = "diag_pattern_editor_oc"
 
 -- ── optional remote logging (best-effort) ──────
