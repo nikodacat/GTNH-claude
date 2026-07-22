@@ -21,6 +21,7 @@
 #    POST /request_craft        -- Claude (via tools/request_craft.py) queues a craft job
 #    GET  /next_job             -- OC's background poll: claim the oldest queued craft job
 #    POST /report_job_result    -- OC reports a claimed job's outcome (success/failure + details)
+#    POST /label_machine        -- Claude (via tools/label_machine.py) labels an unlabeled machine
 # =============================================
 
 import http.server
@@ -292,6 +293,49 @@ def save_pending_jobs():
     with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(pending_jobs, f, ensure_ascii=False, indent=2)
     os.replace(tmp_path, PENDING_JOBS_PATH)
+
+
+# ── machine identity tracking (interface_meta.json) ────────────────────
+# Answers "which physical machine does this me_interface actually belong
+# to". Convention (user's own design): a newly-set-up, not-yet-labeled
+# machine gets a real, validly-encoded pattern for plain minecraft:stick
+# (damage 0) placed in one of its me_interface's pattern slots as a
+# marker -- deliberately reusing the exact recipe (2 planks + saw ->
+# stick) already proven to validate via getCraftables() in this
+# project's pattern-writing history, so the marker itself is a real,
+# working pattern, not a fake/invalid one. scan_patterns_oc.lua needs NO
+# changes for this -- it already reports every occupied slot's exact
+# output id/damage via POST /report_pattern, so the marker check happens
+# entirely here in handle_report_pattern (see below).
+#
+# First time a marker is seen on an interface: record it with
+# machine=None and push ONE chat prompt asking what it is. Every scan
+# after that (until answered) sees the same marker again but does NOT
+# re-prompt -- silently skipped once an entry already exists. Once
+# labeled via POST /label_machine (Claude calls this through
+# tools/label_machine.py when the player answers in chat), machine gets
+# set and the marker is simply ignored on every future scan.
+STICK_MARKER_ID = "minecraft:stick"
+STICK_MARKER_DAMAGE = 0
+INTERFACE_META_PATH = "interface_meta.json"
+interface_meta = {}   # interface_address -> {interface_address, interface_label, machine, first_marker_seen, marker_pattern_index}
+interface_meta_lock = threading.Lock()
+
+def load_interface_meta():
+    global interface_meta
+    if not os.path.exists(INTERFACE_META_PATH):
+        print(f"[~] {INTERFACE_META_PATH} not found -- starting with no known machines.")
+        return
+    with open(INTERFACE_META_PATH, "r", encoding="utf-8") as f:
+        interface_meta = json.load(f)
+    print(f"[~] Loaded interface_meta.json: {len(interface_meta):,} interface(s) on record.")
+
+def save_interface_meta():
+    """Write interface_meta back to disk. Caller must hold interface_meta_lock."""
+    tmp_path = INTERFACE_META_PATH + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(interface_meta, f, ensure_ascii=False, indent=2)
+    os.replace(tmp_path, INTERFACE_META_PATH)
 
 
 # ── craft tree planner -- PHASE 1: static, recipe_db.json + ore_dict.json
@@ -665,17 +709,20 @@ def check_claude():
 # their own context. See tools/*.py for the actual scripts -- each is a
 # thin wrapper around an existing server endpoint, so there's exactly
 # one implementation of each lookup no matter who calls it.
-CRAFT_TOOLS_SYSTEM = """You have access to four command-line tools (run them with your Bash tool, exactly as shown -- nothing else is permitted):
-  python3 tools/resolve_item.py <name>          -- resolve an item name/label (English or otherwise -- translate it yourself first if needed) to candidate item ids
-  python3 tools/get_recipe.py <item_id>          -- look up recipe_db.json recipes for an exact item id
-  python3 tools/craft_plan.py <item_id> [qty]    -- get the static craft-tree plan for item+qty
-  python3 tools/request_craft.py <item_id> <qty> -- QUEUE a craft request (does NOT execute it -- see below)
+CRAFT_TOOLS_SYSTEM = """You have access to five command-line tools (run them with your Bash tool, exactly as shown -- nothing else is permitted):
+  python3 tools/resolve_item.py <name>              -- resolve an item name/label (English or otherwise -- translate it yourself first if needed) to candidate item ids
+  python3 tools/get_recipe.py <item_id>              -- look up recipe_db.json recipes for an exact item id
+  python3 tools/craft_plan.py <item_id> [qty]        -- get the static craft-tree plan for item+qty
+  python3 tools/request_craft.py <item_id> <qty>     -- QUEUE a craft request (does NOT execute it -- see below)
+  python3 tools/label_machine.py <interface_address> <machine name> -- label a not-yet-identified machine (see below)
 
 Important limits on request_craft.py, since this is easy to get wrong:
 - It only adds the job to a queue. Only the physical OC computer in-game can actually touch AE2 (check a free crafting CPU, submit the request) -- it picks up queued jobs on its own background schedule, not instantly. Tell the player it's QUEUED, never that it's done.
 - Completion is reported separately later, as its own chat message, once the OC side finishes the job -- you will not see that result in this same turn.
 - If craft_plan.py or request_craft.py returns a non-empty "needs_player_input", that means a real recipe ambiguity or dependency loop the planner can't resolve alone -- explain the options to the player and ask them to choose. Do not call request_craft.py again for that item until they do, and do not guess.
-- Only use request_craft.py when the player has actually asked for something to be crafted -- use craft_plan.py/get_recipe.py/resolve_item.py freely just to answer questions, without queuing anything."""
+- Only use request_craft.py when the player has actually asked for something to be crafted -- use craft_plan.py/get_recipe.py/resolve_item.py freely just to answer questions, without queuing anything.
+
+About label_machine.py: when a machine's ME interface has never been identified yet, a scan reports it and you'll see a chat message like "Found an unlabeled machine -- interface \"<label>\" (stick marker in pattern slot N). What machine is this?" -- that message (earlier in this same conversation) contains the exact interface_address to use. When the player answers (e.g. "that one's the Circuit Assembler"), call label_machine.py with that same interface_address and the name they gave. Never invent or guess an interface_address that wasn't given to you in an actual scan message."""
 
 # ── call claude -p ────────────────────────────────────────────
 def ask_claude(messages, system=None):
@@ -693,7 +740,7 @@ def ask_claude(messages, system=None):
     # "python" prefixes are allowed since which one resolves depends on
     # the player's own PC setup (this server has no way to verify that
     # from here).
-    craft_tool_scripts = ["resolve_item.py", "get_recipe.py", "craft_plan.py", "request_craft.py"]
+    craft_tool_scripts = ["resolve_item.py", "get_recipe.py", "craft_plan.py", "request_craft.py", "label_machine.py"]
     allowed_tools = []
     for script in craft_tool_scripts:
         allowed_tools.append(f"Bash(python3 tools/{script}:*)")
@@ -1648,6 +1695,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.handle_report_job_result()
             return
 
+        if self.path == "/label_machine":
+            self.handle_label_machine()
+            return
+
         if self.path != "/chat":
             self.send_json(404, {"error": "use POST /chat"})
             return
@@ -1910,7 +1961,88 @@ class Handler(http.server.BaseHTTPRequestHandler):
             print(f"[pattern-scan] {msg}")
             append_log("diag", msg)
 
+        # ── stick-marker check (unlabeled machine detection) ──────
+        # Independent of is_new/is_changed above (which track the pattern
+        # CONTENT, not the machine-labeling workflow) -- runs every time
+        # this interface reports a stick-output pattern, but only ever
+        # prompts once per interface (see load/save_interface_meta above).
+        is_marker = any(
+            o.get("id") == STICK_MARKER_ID and (o.get("damage", 0) or 0) == STICK_MARKER_DAMAGE
+            for o in outputs
+        )
+        if is_marker:
+            with interface_meta_lock:
+                if addr not in interface_meta:
+                    interface_meta[addr] = {
+                        "interface_address": addr,
+                        "interface_label": label,
+                        "machine": None,
+                        "first_marker_seen": now,
+                        "marker_pattern_index": idx,
+                    }
+                    try:
+                        save_interface_meta()
+                        should_prompt = True
+                    except Exception as e:
+                        print(f"[machine-label][err] failed to save interface_meta.json: {e}")
+                        append_log("error", f"failed to save interface_meta.json: {e}")
+                        should_prompt = False
+                else:
+                    should_prompt = False  # already recorded (labeled or already prompted) -- don't spam
+            if should_prompt:
+                # The raw address MUST appear here, not just the friendly
+                # label -- this is the only place Claude ever sees it, and
+                # tools/label_machine.py needs the exact address (matching
+                # interface_meta.json's key), not a shortened display name.
+                prompt_msg = (f"Found an unlabeled machine -- interface \"{label}\" "
+                              f"(address {addr}, stick marker in pattern slot {idx}). What machine is this?")
+                print(f"[machine-label] {prompt_msg}")
+                append_log("claude", prompt_msg)
+
         self.send_json(200, {"status": "ok", "new": is_new, "changed": is_changed})
+
+    # ── machine labeling endpoint ─────────────────────────────────
+    def handle_label_machine(self):
+        """Called by tools/label_machine.py, which Claude invokes when the
+        player answers a "what machine is this?" prompt in chat. Requires
+        the interface to already be on record (i.e. a stick-marker scan
+        must have reported it first) -- this only fills in the `machine`
+        field, it doesn't create a brand new interface entry from
+        scratch, since we'd have no interface_label/marker_pattern_index
+        to store without a real scan having happened."""
+        data, err = self._read_json_body()
+        if err:
+            self.send_json(400, {"error": err})
+            return
+
+        addr    = data.get("interface_address")
+        machine = data.get("machine")
+        if not addr or not machine:
+            self.send_json(400, {"error": "missing interface_address or machine"})
+            return
+
+        with interface_meta_lock:
+            entry = interface_meta.get(addr)
+            if not entry:
+                self.send_json(404, {
+                    "error": "unknown interface_address -- it needs to show up in a stick-marker "
+                              "scan (scan_patterns_oc.lua) before it can be labeled",
+                })
+                return
+            entry["machine"] = machine
+            entry["labeled_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+            try:
+                save_interface_meta()
+            except Exception as e:
+                print(f"[machine-label][err] failed to save interface_meta.json: {e}")
+                append_log("error", f"failed to save interface_meta.json: {e}")
+                self.send_json(500, {"error": str(e)})
+                return
+
+        label = entry.get("interface_label") or addr[:8]
+        print(f"[machine-label] interface \"{label}\" labeled as: {machine}")
+        append_log("claude", f"Got it -- interface \"{label}\" is now labeled as: {machine}")
+        self.send_json(200, {"status": "ok", "interface_address": addr, "machine": machine})
 
     # ── item label scan endpoint ─────────────────────────────────
     def handle_report_labels(self):
@@ -2071,6 +2203,7 @@ if __name__ == "__main__":
     load_ore_dict()
     load_item_labels()
     load_pending_jobs()
+    load_interface_meta()
 
     # ThreadingHTTPServer, not plain HTTPServer: handle_upload_recipe_image()
     # blocks on a `claude -p` subprocess for up to 120s (vision extraction is
