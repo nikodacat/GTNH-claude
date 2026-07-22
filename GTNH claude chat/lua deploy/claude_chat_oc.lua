@@ -4,7 +4,7 @@
 --  Requires: Internet Card only
 -- =============================================
 
-local DISK = "/mnt/dc6"   -- where scripts + config live
+local DISK = "/home"   -- where scripts + config live (was /mnt/dc6 -- moved to /home, stable across disk swaps)
 
 -- ── libs ─────────────────────────────────────
 local component = require("component")
