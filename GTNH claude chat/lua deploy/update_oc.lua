@@ -13,7 +13,7 @@ local computer  = require("computer")
 local io        = require("io")
 local os        = require("os")
 
-local DISK      = "/mnt/dc6"
+local DISK      = "/home"   -- was /mnt/dc6 (secondary disk mount) -- moved to /home since disk mount labels change when the physical disk is swapped (2026-07-23, T3 disk upgrade); DISK and HOME are now the same path, kept as two names since HOME_FILES below still needs to distinguish "goes in HOME regardless of role" from "goes wherever DISK points"
 local HOME      = "/home"
 local REPO_RAW  = "https://raw.githubusercontent.com/nikodacat/GTNH-claude/main/GTNH%20claude%20chat/lua%20deploy/"
 
