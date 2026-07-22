@@ -15,6 +15,7 @@
 #    POST /discard_recipe       -- drop a pending extracted recipe (browser)
 #    POST /report_pattern       -- report one scanned ME interface pattern (OC)
 #    GET  /oredict              -- resolve an ore:xxx tag to concrete items
+#    GET  /craft_plan           -- static recipe-tree plan for item+qty (phase 1, no live AE2)
 # =============================================
 
 import http.server
@@ -27,6 +28,7 @@ import time
 import base64
 import uuid
 import re
+import math
 
 PORT       = 11434
 CLAUDE_PATH = os.environ.get("CLAUDE_CLI_PATH", "claude")
@@ -204,6 +206,253 @@ def describe_item(entry):
     label = entry.get("label") or entry.get("id", "?")
     count = entry.get("count", 1)
     return f"{count}x {label}"
+
+
+# ── craft tree planner -- PHASE 1: static, recipe_db.json + ore_dict.json
+# only, no live AE2 interaction ─────────────────────────────────────────
+# Given a target item + quantity, recursively resolves the full ingredient
+# tree and how many craft operations each step needs, using only the
+# static data already on disk. Deliberately does NOT check live ME
+# network stock or write/request anything -- that's phase 2 (a stateful
+# server-driven instruction loop with a new OC executor script, not yet
+# built). Phase 1's job is just: "if I had none of anything in stock,
+# what's the full shopping list and craft sequence for N of this item."
+#
+# KNOWN LIMITATION (accepted, not a bug to fix here): if the same
+# intermediate item is needed by multiple branches of the tree (e.g. two
+# different sub-assemblies both need screws), this flattens to separate
+# craft steps per branch rather than merging into one consolidated step --
+# it does not deduplicate/merge shared nodes across the whole tree. This
+# is intentionally left for phase 2 to correct for naturally: phase 2
+# checks REAL stock immediately before each step executes, so by the time
+# a later branch's "craft screws" step runs, it'll see the screws an
+# earlier branch already made and request less (or none) -- the static
+# plan just needs to be correct-enough as a starting point, not optimal.
+MAX_CRAFT_TREE_DEPTH = 50  # defensive guard against pathological/circular recipe_db data
+
+def split_item_id(s):
+    """'modid:name:meta' -> (id, meta)   'modid:name' -> (id, 0)
+    Mirrors the Lua-side splitItemId() used throughout this project's OC
+    scripts -- kept behaviorally identical so an item id resolves the same
+    way whether it happens server-side (here) or OC-side."""
+    parts = s.split(":")
+    if len(parts) >= 3:
+        try:
+            meta = int(parts[-1])
+        except ValueError:
+            meta = 0  # tolerate a non-numeric trailing segment (e.g. stray "*")
+        return ":".join(parts[:-1]), meta
+    return s, 0
+
+def resolve_ore_tag_v1(tag):
+    """Phase 1 has no live stock data yet, so this just returns
+    ore_dict.json's first candidate for the tag -- NOT stock-aware. Phase
+    2 should override this using live ME network stock, mirroring the
+    Lua-side resolveOreTag()'s "prefer whichever candidate you actually
+    have" logic (test_pattern_write_oc.lua / test_pattern_write_direct_oc.lua)."""
+    candidates = ore_dict.get(tag)
+    if not candidates:
+        return None, None
+    item_id, meta = candidates[0]
+    return item_id, (0 if meta is None else meta)
+
+def resolve_ingredient_id(entry):
+    if entry.startswith("ore:"):
+        return resolve_ore_tag_v1(entry)
+    return split_item_id(entry)
+
+def get_ingredient_counts(recipe):
+    """Normalize a recipe object into [(entry_string, count), ...] -- how
+    many of each DISTINCT ingredient entry (before ore:-tag resolution) one
+    execution of this recipe needs. Aggregates duplicate entries (e.g. a
+    shapeless recipe listing "ore:plankWood" twice) into one (entry, 2)
+    pair -- this is a planning-quantity concern, deliberately separate from
+    how many individual AE2 pattern GRID SLOTS an ingredient occupies
+    (that's the pattern-writer's concern, which does NOT aggregate -- see
+    the shapeless count-vs-slots bug fixed in test_pattern_write_oc.lua;
+    aggregating there was the actual bug, aggregating HERE is correct)."""
+    rtype = recipe.get("type")
+    counts = {}
+    order = []
+    def bump(entry, n=1):
+        if entry not in counts:
+            counts[entry] = 0
+            order.append(entry)
+        counts[entry] += n
+
+    if rtype == "crafting_shaped":
+        for entry in (recipe.get("grid") or []):
+            if entry:
+                bump(entry)
+    elif rtype == "crafting_shapeless":
+        for entry in (recipe.get("ingredients") or []):
+            if entry:
+                bump(entry)
+    elif rtype == "gt_machine":
+        for ing in (recipe.get("item_inputs") or []):
+            entry = ing.get("item")
+            if entry:
+                bump(entry, ing.get("count", 1) or 1)
+        # fluid_inputs intentionally NOT handled yet -- no fluid transport/
+        # matching exists anywhere in this project so far. A gt_machine
+        # recipe needing fluids will silently plan only its item inputs;
+        # flagged in build_craft_tree()'s node as "fluids_ignored".
+
+    return [(e, counts[e]) for e in order]
+
+def get_recipe_output_count(recipe):
+    """How many of the target item ONE execution of this recipe yields."""
+    rtype = recipe.get("type")
+    if rtype in ("crafting_shaped", "crafting_shapeless"):
+        return max(1, recipe.get("output_count", 1) or 1)
+    if rtype == "gt_machine":
+        target = recipe.get("item")
+        for out in (recipe.get("item_outputs") or []):
+            if out.get("item") == target:
+                return max(1, out.get("count", 1) or 1)
+        return 1  # target not among its own declared outputs -- shouldn't normally happen
+    return 1
+
+def select_recipe(candidates):
+    """v1 heuristic: prefer whichever recipe has the fewest distinct
+    ingredient lines (simplest/cheapest-looking), tie-broken by whichever
+    appears first in recipe_db.json. PLACEHOLDER -- a later phase should
+    instead prefer whichever recipe matches an EXISTING scanned pattern in
+    known_patterns.json (real, ground-truth, no ambiguity) over guessing
+    from recipe_db.json, which can list multiple recipes for the same
+    output item with no indication of which one is actually in use --
+    this exact ambiguity picked a Saw-based stick recipe over the plain
+    one in a real run (see project memory, 2026-07-22)."""
+    if not candidates:
+        return None
+    return min(candidates, key=lambda r: len(get_ingredient_counts(r)))
+
+def build_craft_tree(item, qty, _ancestors=None):
+    """Recursively resolve how to make `qty` of `item`. Returns a node
+    dict; see the module docstring above for the overall design. A "leaf"
+    is a raw material with no recipe_db.json entry, an unresolvable ore:
+    tag, a detected circular dependency, or the max-depth guard tripping --
+    all treated the same way (nothing more to recurse into), just with a
+    different `leaf_reason` for whichever applies."""
+    ancestors = _ancestors or []
+
+    # Genuine loops (and the max-depth safety trip, which in practice only
+    # ever fires because of a loop the ancestor-chain check somehow missed)
+    # are NOT silently resolved by picking a recipe -- there's no algorithmic
+    # way to know which of the competing recipes actually breaks the cycle,
+    # so this stops here and hands the real candidates back up for a human
+    # to pick from (see find_flagged_nodes() below and its use in the
+    # /craft_plan handler, which turns this into a plain-language chat
+    # message). This is deliberately narrower than flagging every multi-
+    # candidate item (nearly everything has >1 recipe_db.json entry) --
+    # only a true loop means the planner has NO confident choice at all.
+    if item in ancestors:
+        return {"item": item, "qty": qty, "is_leaf": True, "needs_player_input": True,
+                "leaf_reason": "circular dependency (already an ancestor of itself in this tree)",
+                "ancestor_chain": ancestors + [item], "candidate_recipes": recipe_db.get(item) or []}
+    if len(ancestors) >= MAX_CRAFT_TREE_DEPTH:
+        return {"item": item, "qty": qty, "is_leaf": True, "needs_player_input": True,
+                "leaf_reason": f"max tree depth ({MAX_CRAFT_TREE_DEPTH}) reached",
+                "ancestor_chain": ancestors + [item], "candidate_recipes": recipe_db.get(item) or []}
+
+    candidates = recipe_db.get(item)
+    if not candidates:
+        return {"item": item, "qty": qty, "is_leaf": True, "leaf_reason": "no recipe in recipe_db.json"}
+
+    recipe = select_recipe(candidates)
+    output_count = get_recipe_output_count(recipe)
+    crafts_needed = math.ceil(qty / output_count)
+
+    ingredients = []
+    for entry, per_craft_count in get_ingredient_counts(recipe):
+        resolved_id, resolved_damage = resolve_ingredient_id(entry)
+        total_needed = per_craft_count * crafts_needed
+        if resolved_id is None:
+            ingredients.append({
+                "entry": entry, "resolved_id": None, "resolved_damage": None, "qty_needed": total_needed,
+                "node": {"item": entry, "qty": total_needed, "is_leaf": True,
+                         "leaf_reason": "could not resolve ore: tag (not in ore_dict.json)"},
+            })
+            continue
+        child = build_craft_tree(resolved_id, total_needed, ancestors + [item])
+        ingredients.append({
+            "entry": entry, "resolved_id": resolved_id, "resolved_damage": resolved_damage,
+            "qty_needed": total_needed, "node": child,
+        })
+
+    node = {
+        "item": item, "qty": qty, "is_leaf": False,
+        "recipe_type": recipe.get("type"), "output_count": output_count,
+        "crafts_needed": crafts_needed, "ingredients": ingredients,
+    }
+    if recipe.get("type") == "gt_machine" and recipe.get("fluid_inputs"):
+        node["fluids_ignored"] = recipe["fluid_inputs"]
+    return node
+
+def flatten_craft_tree(node, leaves=None, steps=None):
+    """Post-order flatten of a build_craft_tree() result into:
+      leaves: {item: total_raw_qty}    -- aggregated across every branch
+      steps:  [craft step, ...]        -- children before parents (so
+              executing in this order guarantees every ingredient a step
+              needs was already produced by an earlier step). See the
+              module-level KNOWN LIMITATION note above: this does NOT
+              merge/dedupe the same intermediate item across branches."""
+    if leaves is None: leaves = {}
+    if steps is None: steps = []
+
+    if node.get("is_leaf"):
+        leaves[node["item"]] = leaves.get(node["item"], 0) + node["qty"]
+        return leaves, steps
+
+    for ing in node["ingredients"]:
+        flatten_craft_tree(ing["node"], leaves, steps)
+
+    steps.append({
+        "item": node["item"], "qty": node["qty"], "recipe_type": node["recipe_type"],
+        "output_count": node["output_count"], "crafts_needed": node["crafts_needed"],
+    })
+    return leaves, steps
+
+def find_flagged_nodes(node, out=None):
+    """Walk a build_craft_tree() result collecting every node that needs
+    player attention -- currently just genuine loops and the max-depth
+    safety trip (see build_craft_tree()'s comment on why those two, and
+    only those two, stop the planner cold instead of picking a recipe)."""
+    if out is None:
+        out = []
+    if node.get("is_leaf"):
+        if node.get("needs_player_input"):
+            out.append(node)
+        return out
+    for ing in node["ingredients"]:
+        find_flagged_nodes(ing["node"], out)
+    return out
+
+def describe_flagged_nodes_for_chat(item, qty, flagged):
+    """Turn find_flagged_nodes() output into a plain-language chat message
+    -- literally the "AI just calls it out and tells the player to choose"
+    behavior. Lists each stuck item's real candidate recipes (ingredient
+    summary only, not the full JSON) so there's actually something to
+    choose between, not just an error."""
+    lines = [f"Craft plan for {qty}x {item} hit {len(flagged)} spot(s) that need your input "
+             f"(a real dependency loop, or several recipes chained too deep to resolve automatically):"]
+    for node in flagged:
+        chain = " -> ".join(node.get("ancestor_chain") or [node["item"]])
+        lines.append(f"- {node['item']}: {node['leaf_reason']}")
+        lines.append(f"    chain: {chain}")
+        candidates = node.get("candidate_recipes") or []
+        if not candidates:
+            lines.append("    (no recipe_db.json entries at all for this item)")
+            continue
+        shown = candidates[:10]
+        for i, r in enumerate(shown, 1):
+            ings = r.get("grid") or r.get("ingredients") or []
+            ings_str = ", ".join(e for e in ings if e) or "(no ingredients listed)"
+            lines.append(f"    {i}. [{r.get('type','?')}] {ings_str}")
+        if len(candidates) > 10:
+            lines.append(f"    ... and {len(candidates) - 10} more recipe(s) not shown")
+    lines.append("Pick which recipe should be used for the looping item(s) above, then ask again.")
+    return "\n".join(lines)
 
 
 # ── image-based recipe extraction (staged, needs confirmation) ────────────
@@ -1148,6 +1397,43 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     "found"  : len(entries) > 0,
                     "count"  : len(entries),
                     "entries": entries,
+                })
+
+        elif self.path.startswith("/craft_plan"):
+            # /craft_plan?item=minecraft:stick&qty=8
+            # Phase 1 of the craft-tree planner (see build_craft_tree()'s
+            # module comment) -- static recipe_db.json/ore_dict.json only,
+            # no live AE2 stock check, nothing is written or requested.
+            # Returns the full tree plus a flattened leaf shopping-list and
+            # ordered craft-step sequence, for inspection/testing ahead of
+            # phase 2 (the live, stateful execution loop).
+            item, qty = None, 1
+            if "item=" in self.path:
+                item = self.path.split("item=")[1].split("&")[0]
+                item = item.replace("%3A", ":").replace("+", " ")
+            if "qty=" in self.path:
+                try: qty = max(1, int(self.path.split("qty=")[1].split("&")[0]))
+                except: qty = 1
+            if not item:
+                self.send_json(400, {"error": "missing ?item= parameter"})
+            elif not recipe_db:
+                self.send_json(503, {"error": "recipe DB not loaded"})
+            else:
+                tree = build_craft_tree(item, qty)
+                leaves, steps = flatten_craft_tree(tree)
+                flagged = find_flagged_nodes(tree)
+                if flagged:
+                    # surface it in the chat log too, not just the raw JSON --
+                    # this is the "AI calls it out and tells the player to
+                    # choose" behavior, so it's visible without anyone having
+                    # to go read a /craft_plan response by hand.
+                    append_log("claude", describe_flagged_nodes_for_chat(item, qty, flagged))
+                self.send_json(200, {
+                    "item": item, "qty": qty,
+                    "tree": tree,
+                    "leaves": leaves,
+                    "steps": steps,
+                    "needs_player_input": flagged,
                 })
 
         else:
