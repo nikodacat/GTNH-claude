@@ -25,6 +25,8 @@
 #    POST /request_scan         -- Claude (via tools/request_scan.py) queues a ME-interface pattern scan
 #    GET  /next_scan            -- scanning OC computer's background poll: claim the oldest queued scan request
 #    POST /report_scan_result   -- scanning OC computer reports a claimed scan's outcome
+#    POST /unlabel_machine      -- Claude (via tools/unlabel_machine.py) undoes a mislabeled interface + its recipes
+#    POST /remove_recipe        -- Claude (via tools/remove_recipe.py) deletes a specific bad/mislearned recipe
 # =============================================
 
 import http.server
@@ -288,6 +290,56 @@ def save_learned_recipe(machine_name, inputs, outputs):
             append_log("error", f"failed to save recipe_db.json: {e}")
             return None
     return primary_item
+
+def remove_gt_machine_recipes(machine_name, item_id=None):
+    """Removes learned gt_machine recipes for `machine_name` from
+    recipe_db.json -- used for undoing a mislabel (see handle_unlabel_machine)
+    or just deleting a specific bad recipe (see handle_remove_recipe).
+    If item_id is given, only that item's entries under this machine are
+    removed; otherwise every gt_machine recipe for this machine is purged
+    (bulk cleanup, e.g. after a scan/learning bug produced several bad
+    entries at once, like the count=0 pattern-scan bug did).
+
+    Only touches type=="gt_machine" entries -- never crafting-table/
+    NEI-parsed recipes, which have no `machine` field at all and can't
+    accidentally match. Caller must hold recipe_db_lock is NOT required --
+    this function takes the lock itself (unlike save_learned_recipe, which
+    expects inputs already resolved outside the lock -- this one doesn't
+    need to build anything first, so it's simpler to just own the lock
+    for its whole body).
+
+    Returns (removed_count, affected_item_ids)."""
+    removed = 0
+    affected = []
+    with recipe_db_lock:
+        for item, recipes in list(recipe_db.items()):
+            if item_id is not None and item != item_id:
+                continue
+            kept = [r for r in recipes
+                    if not (isinstance(r, dict) and r.get("type") == "gt_machine"
+                            and r.get("machine") == machine_name)]
+            n_removed = len(recipes) - len(kept)
+            if n_removed:
+                removed += n_removed
+                affected.append(item)
+                if kept:
+                    recipe_db[item] = kept
+                else:
+                    del recipe_db[item]
+        if removed:
+            try:
+                save_recipe_db()
+            except Exception as e:
+                print(f"[recipe-remove][err] failed to save recipe_db.json: {e}")
+                append_log("error", f"failed to save recipe_db.json: {e}")
+                # don't try to undo the in-memory removal -- a failed save
+                # here would need the exact same reload-from-disk recovery
+                # as any other save_recipe_db() failure elsewhere in this
+                # file; leaving recipe_db as-is (removed in memory, stale
+                # on disk until the next successful save) matches how
+                # save_interface_meta()/save_known_patterns() failures are
+                # already handled everywhere else in this project.
+    return removed, affected
 
 
 # ── item label index (id:meta -> display name) ────────────────────────
@@ -824,13 +876,15 @@ def check_claude():
 # their own context. See tools/*.py for the actual scripts -- each is a
 # thin wrapper around an existing server endpoint, so there's exactly
 # one implementation of each lookup no matter who calls it.
-CRAFT_TOOLS_SYSTEM = """You have access to six command-line tools (run them with your Bash tool, exactly as shown -- nothing else is permitted):
+CRAFT_TOOLS_SYSTEM = """You have access to eight command-line tools (run them with your Bash tool, exactly as shown -- nothing else is permitted):
   python tools/resolve_item.py <name>              -- resolve an item name/label (English or otherwise -- translate it yourself first if needed) to candidate item ids
   python tools/get_recipe.py <item_id>              -- look up recipe_db.json recipes for an exact item id
   python tools/craft_plan.py <item_id> [qty]        -- get the static craft-tree plan for item+qty
   python tools/request_craft.py <item_id> <qty>     -- QUEUE a craft request (does NOT execute it -- see below)
   python tools/label_machine.py <interface_address> <machine name> -- label a not-yet-identified machine (see below)
   python tools/request_scan.py                     -- QUEUE a full ME-interface pattern scan (does NOT run it instantly -- see below)
+  python tools/unlabel_machine.py <interface_address> -- undo a mislabeled machine (see below)
+  python tools/remove_recipe.py <machine name> [item_id] -- delete a specific bad/mislearned recipe, or all recipes for that machine if item_id is omitted (see below)
 
 IMPORTANT: always run these with `python`, never `python3`. On this machine, `python3` resolves to a broken Windows Store redirect stub that silently exits with no output whenever it's run non-interactively -- it will look like the tool did nothing, with no error to explain why. `python` is the one that actually works.
 
@@ -846,7 +900,12 @@ Important limits on request_scan.py, similar shape to request_craft.py:
 - Use this when the player asks you to check for new/changed machine patterns (e.g. "did you see my new machine yet?", "rescan"). This is unrelated to item-label scanning (the "scan_labels" OC terminal command) -- that's a different feature entirely, not something you can trigger via a tool.
 - If an unlabeled machine turns up from a scan, you'll see it as a chat message ("Found an unidentified machine...") the same way as before -- ask the player what it is and use label_machine.py, same as always.
 
-About label_machine.py: when a machine's ME interface has never been identified yet, a scan reports it and you'll see a chat message like "Found an unidentified machine -- interface \"<label>\" (address <addr>). What machine is this?" -- that message (earlier in this same conversation) contains the exact interface_address to use. When the player answers (e.g. "that one's the Circuit Assembler"), call label_machine.py with that same interface_address and the name they gave. Never invent or guess an interface_address that wasn't given to you in an actual scan message."""
+About label_machine.py: when a machine's ME interface has never been identified yet, a scan reports it and you'll see a chat message like "Found an unidentified machine -- interface \"<label>\" (address <addr>). What machine is this?" -- that message (earlier in this same conversation) contains the exact interface_address to use. When the player answers (e.g. "that one's the Circuit Assembler"), call label_machine.py with that same interface_address and the name they gave. Never invent or guess an interface_address that wasn't given to you in an actual scan message.
+
+About unlabel_machine.py and remove_recipe.py -- fixing mistakes:
+- If the player says a machine was labeled wrong (e.g. "that's not actually a Circuit Assembler", "undo that", "I was just testing"), call unlabel_machine.py with that interface_address. This resets the interface to unlabeled (the "Found an unidentified machine..." prompt will fire again on the next scan) AND deletes every recipe that was learned under the wrong machine name. You need the interface_address for this -- if you don't already have it from earlier in this conversation, you can't guess it; ask the player to trigger another scan so it shows up again, or check whether the address is visible in an earlier message.
+- If only a specific recipe looks wrong (e.g. quantities look off, wrong ingredients) but the machine's own label is correct, use remove_recipe.py instead -- it deletes just that item's recipe(s) for that machine without touching the label. Pass the item id and the machine name; add the item id only when you want to remove ONE specific recipe, or ask the player if they mean "just this one" vs "everything learned for this machine" before calling it with no item id (which wipes every recipe ever learned for that machine).
+- Neither tool undoes anything automatically or silently -- always tell the player what was removed (the tool's response says how many recipes and which items) so they know what's gone."""
 
 # ── call claude -p ────────────────────────────────────────────
 def ask_claude(messages, system=None):
@@ -859,7 +918,7 @@ def ask_claude(messages, system=None):
     parts.append("[Assistant]\n(reply below)")
     prompt = "\n\n".join(parts)
 
-    # Scoped to exactly these 6 scripts -- Claude cannot run arbitrary Bash
+    # Scoped to exactly these 8 scripts -- Claude cannot run arbitrary Bash
     # commands, only these specific invocations. Both "python3" and
     # "python" prefixes are allowlisted, but CRAFT_TOOLS_SYSTEM above tells
     # Claude to always use "python": on this Windows deployment "python3"
@@ -868,7 +927,7 @@ def ask_claude(messages, system=None):
     # see anthropics/claude-code#57946. Keeping the "python3" allowlist
     # entries around is harmless (they're just never used in practice) in
     # case a future machine's PATH ordering differs.
-    craft_tool_scripts = ["resolve_item.py", "get_recipe.py", "craft_plan.py", "request_craft.py", "label_machine.py", "request_scan.py"]
+    craft_tool_scripts = ["resolve_item.py", "get_recipe.py", "craft_plan.py", "request_craft.py", "label_machine.py", "request_scan.py", "unlabel_machine.py", "remove_recipe.py"]
     allowed_tools = []
     for script in craft_tool_scripts:
         allowed_tools.append(f"Bash(python3 tools/{script}:*)")
@@ -1865,6 +1924,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.handle_report_scan_result()
             return
 
+        if self.path == "/unlabel_machine":
+            self.handle_unlabel_machine()
+            return
+
+        if self.path == "/remove_recipe":
+            self.handle_remove_recipe()
+            return
+
         if self.path != "/chat":
             self.send_json(404, {"error": "use POST /chat"})
             return
@@ -2258,6 +2325,96 @@ class Handler(http.server.BaseHTTPRequestHandler):
             append_log("claude", f"Also learned {len(learned_items)} recipe(s) already on that interface for {machine}: {items_desc}")
 
         self.send_json(200, {"status": "ok", "interface_address": addr, "machine": machine, "learned_recipes": learned_items})
+
+    # ── undo a mislabel ───────────────────────────────────────────
+    def handle_unlabel_machine(self):
+        """Called by tools/unlabel_machine.py, for when a player told Claude
+        the wrong machine name (or was just testing) and wants to undo it.
+        Resets the interface's `machine` field back to unset, so the
+        normal "Found an unidentified machine..." prompt fires again next
+        time a pattern is (re-)scanned on it -- same first-time flow as a
+        genuinely new interface. Also purges every gt_machine recipe that
+        was learned under the OLD (wrong) machine name, since those are
+        exactly as wrong as the label was.
+
+        Caveat, told to the player/Claude via the response message: if
+        that same machine name was ALSO used correctly to label a
+        different physical interface, this purges recipes from that one
+        too -- recipes aren't tagged with which interface they came from,
+        only which machine name. Acceptable for this project's scale; not
+        worth a schema migration to fix unless it actually bites someone."""
+        data, err = self._read_json_body()
+        if err:
+            self.send_json(400, {"error": err})
+            return
+
+        addr = data.get("interface_address")
+        if not addr:
+            self.send_json(400, {"error": "missing interface_address"})
+            return
+
+        with interface_meta_lock:
+            entry = interface_meta.get(addr)
+            if not entry:
+                self.send_json(404, {"error": "unknown interface_address"})
+                return
+            old_machine = entry.get("machine")
+            if not old_machine:
+                self.send_json(400, {"error": "this interface isn't labeled -- nothing to undo"})
+                return
+            entry["machine"] = None
+            entry.pop("labeled_at", None)
+            try:
+                save_interface_meta()
+            except Exception as e:
+                print(f"[machine-label][err] failed to save interface_meta.json: {e}")
+                append_log("error", f"failed to save interface_meta.json: {e}")
+                self.send_json(500, {"error": str(e)})
+                return
+
+        removed, affected = remove_gt_machine_recipes(old_machine)
+
+        label = entry.get("interface_label") or addr[:8]
+        msg = f"Unlabeled interface \"{label}\" (was: {old_machine})."
+        if removed:
+            msg += f" Also removed {removed} recipe(s) learned under that name ({', '.join(affected)})."
+        else:
+            msg += " No recipes had been learned under that name."
+        print(f"[machine-label] {msg}")
+        append_log("claude", msg)
+        self.send_json(200, {"status": "ok", "interface_address": addr, "old_machine": old_machine,
+                              "removed_recipes": removed, "affected_items": affected})
+
+    # ── remove a specific bad/mislearned recipe ─────────────────────
+    def handle_remove_recipe(self):
+        """Called by tools/remove_recipe.py. Deletes learned gt_machine
+        recipe(s) for a given machine name -- either just one item
+        (`item` provided) or every recipe ever learned for that machine
+        (`item` omitted, bulk cleanup). Does NOT touch the interface's
+        label -- use /unlabel_machine instead if the machine name itself
+        was wrong, not just one specific recipe reading."""
+        data, err = self._read_json_body()
+        if err:
+            self.send_json(400, {"error": err})
+            return
+
+        machine = data.get("machine")
+        item    = data.get("item")  # optional
+        if not machine:
+            self.send_json(400, {"error": "missing machine"})
+            return
+
+        removed, affected = remove_gt_machine_recipes(machine, item_id=item)
+
+        if removed:
+            scope = f"item {item}" if item else "all items"
+            msg = f"Removed {removed} recipe(s) for {machine} ({scope}): {', '.join(affected)}"
+        else:
+            msg = f"No matching recipes found for {machine}" + (f" / {item}" if item else "")
+        print(f"[recipe-remove] {msg}")
+        append_log("claude", msg)
+        self.send_json(200, {"status": "ok", "machine": machine, "item": item,
+                              "removed_recipes": removed, "affected_items": affected})
 
     # ── item label scan endpoint ─────────────────────────────────
     def handle_report_labels(self):
