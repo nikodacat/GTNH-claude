@@ -27,6 +27,8 @@
 #    POST /report_scan_result   -- scanning OC computer reports a claimed scan's outcome
 #    POST /unlabel_machine      -- Claude (via tools/unlabel_machine.py) undoes a mislabeled interface + its recipes
 #    POST /remove_recipe        -- Claude (via tools/remove_recipe.py) deletes a specific bad/mislearned recipe
+#    POST /mark_importer        -- Claude (via tools/mark_importer.py) marks an interface as the shared wildcard importer
+#    POST /sort_pattern         -- Claude (via tools/sort_pattern.py) resolves a pending importer sort into a learned recipe
 # =============================================
 
 import http.server
@@ -488,6 +490,13 @@ INTERFACE_META_PATH = "interface_meta.json"
 interface_meta = {}   # interface_address -> {interface_address, interface_label, machine, first_marker_seen, marker_pattern_index}
 interface_meta_lock = threading.Lock()
 
+# Reserved `machine` value marking an interface as the shared "importer" --
+# see the pending_sorts section below for the full feature. Not a display
+# name (never shown to the player as-is -- messages always say "the
+# importer interface" instead), just an internal sentinel that can't
+# collide with a real in-game machine name.
+WILDCARD_MACHINE = "__WILDCARD_IMPORTER__"
+
 def load_interface_meta():
     global interface_meta
     if not os.path.exists(INTERFACE_META_PATH):
@@ -503,6 +512,41 @@ def save_interface_meta():
     with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(interface_meta, f, ensure_ascii=False, indent=2)
     os.replace(tmp_path, INTERFACE_META_PATH)
+
+
+# ── wildcard-importer pending sorts (pending_sorts.json) ───────────────
+# A single physical me_interface can be marked (see handle_mark_importer,
+# tools/mark_importer.py) as a shared staging spot: the player drops ANY
+# freshly-encoded pattern onto it -- for whichever machine, doesn't matter
+# which -- and Claude asks per-PATTERN which machine it's actually for,
+# rather than the normal per-INTERFACE labeling flow (which assumes one
+# interface == one fixed machine forever). This is a genuinely different
+# shape of "pending" than interface_meta's should_prompt/machine_name
+# check: an ordinary interface asks ONCE, ever; the importer asks EVERY
+# time a new/changed pattern shows up on it, since a different physical
+# pattern can occupy the same slot number on completely different visits.
+# Keyed by a short random sort_id (same style as pending_recipes' pid) so
+# tools/sort_pattern.py can resolve a specific pending prompt without
+# needing to re-identify the pattern by content.
+PENDING_SORTS_PATH = "pending_sorts.json"
+pending_sorts = {}   # sort_id -> {interface_address, interface_label, pattern_index, inputs, outputs, requested_at}
+pending_sorts_lock = threading.Lock()
+
+def load_pending_sorts():
+    global pending_sorts
+    if not os.path.exists(PENDING_SORTS_PATH):
+        print(f"[~] {PENDING_SORTS_PATH} not found -- starting with no pending sorts.")
+        return
+    with open(PENDING_SORTS_PATH, "r", encoding="utf-8") as f:
+        pending_sorts = json.load(f)
+    print(f"[~] Loaded pending_sorts.json: {len(pending_sorts):,} pending sort(s) on record.")
+
+def save_pending_sorts():
+    """Write pending_sorts back to disk. Caller must hold pending_sorts_lock."""
+    tmp_path = PENDING_SORTS_PATH + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(pending_sorts, f, ensure_ascii=False, indent=2)
+    os.replace(tmp_path, PENDING_SORTS_PATH)
 
 
 # ── craft tree planner -- PHASE 1: static, recipe_db.json + ore_dict.json
@@ -876,7 +920,7 @@ def check_claude():
 # their own context. See tools/*.py for the actual scripts -- each is a
 # thin wrapper around an existing server endpoint, so there's exactly
 # one implementation of each lookup no matter who calls it.
-CRAFT_TOOLS_SYSTEM = """You have access to eight command-line tools (run them with your Bash tool, exactly as shown -- nothing else is permitted):
+CRAFT_TOOLS_SYSTEM = """You have access to ten command-line tools (run them with your Bash tool, exactly as shown -- nothing else is permitted):
   python tools/resolve_item.py <name>              -- resolve an item name/label (English or otherwise -- translate it yourself first if needed) to candidate item ids
   python tools/get_recipe.py <item_id>              -- look up recipe_db.json recipes for an exact item id
   python tools/craft_plan.py <item_id> [qty]        -- get the static craft-tree plan for item+qty
@@ -885,6 +929,8 @@ CRAFT_TOOLS_SYSTEM = """You have access to eight command-line tools (run them wi
   python tools/request_scan.py                     -- QUEUE a full ME-interface pattern scan (does NOT run it instantly -- see below)
   python tools/unlabel_machine.py <interface_address> -- undo a mislabeled machine (see below)
   python tools/remove_recipe.py <machine name> [item_id] -- delete a specific bad/mislearned recipe, or all recipes for that machine if item_id is omitted (see below)
+  python tools/mark_importer.py <interface_address> -- mark an interface as the shared wildcard importer (see below)
+  python tools/sort_pattern.py <sort_id> <machine name> -- resolve a pending importer sort prompt (see below)
 
 IMPORTANT: always run these with `python`, never `python3`. On this machine, `python3` resolves to a broken Windows Store redirect stub that silently exits with no output whenever it's run non-interactively -- it will look like the tool did nothing, with no error to explain why. `python` is the one that actually works.
 
@@ -905,7 +951,12 @@ About label_machine.py: when a machine's ME interface has never been identified 
 About unlabel_machine.py and remove_recipe.py -- fixing mistakes:
 - If the player says a machine was labeled wrong (e.g. "that's not actually a Circuit Assembler", "undo that", "I was just testing"), call unlabel_machine.py with that interface_address. This resets the interface to unlabeled (the "Found an unidentified machine..." prompt will fire again on the next scan) AND deletes every recipe that was learned under the wrong machine name. You need the interface_address for this -- if you don't already have it from earlier in this conversation, you can't guess it; ask the player to trigger another scan so it shows up again, or check whether the address is visible in an earlier message.
 - If only a specific recipe looks wrong (e.g. quantities look off, wrong ingredients) but the machine's own label is correct, use remove_recipe.py instead -- it deletes just that item's recipe(s) for that machine without touching the label. Pass the item id and the machine name; add the item id only when you want to remove ONE specific recipe, or ask the player if they mean "just this one" vs "everything learned for this machine" before calling it with no item id (which wipes every recipe ever learned for that machine).
-- Neither tool undoes anything automatically or silently -- always tell the player what was removed (the tool's response says how many recipes and which items) so they know what's gone."""
+- Neither tool undoes anything automatically or silently -- always tell the player what was removed (the tool's response says how many recipes and which items) so they know what's gone.
+
+About mark_importer.py and sort_pattern.py -- the shared "wildcard" interface:
+- Some setups have ONE physical ME interface set aside as a shared staging spot, where the player can drop a freshly-encoded pattern for ANY machine without needing a dedicated interface per machine. If the player says something like "mark this as the importer" or "this interface can hold any pattern", call mark_importer.py with that interface_address. This interface itself is NOT a real machine and can't craft anything -- it's just a place patterns pass through on their way to being identified.
+- Once marked, every new or changed pattern placed on that interface produces its own chat message: "New pattern on the importer interface ...: in: X -> out: Y. Which machine is this for? (sort_id: <id>)" -- this is DIFFERENT from the normal "Found an unidentified machine" prompt (that one is asked once per interface; this one is asked once per PATTERN, since many different patterns pass through the same importer over time). When the player answers, call sort_pattern.py with that exact sort_id and the machine name they gave -- this learns the recipe for that machine, same as the normal flow, without changing the importer interface's own status.
+- Never guess or reuse a sort_id from a different prompt -- each one is tied to one specific pattern occurrence and can only be answered once (answering it a second time fails with an error since it's no longer pending)."""
 
 # ── call claude -p ────────────────────────────────────────────
 def ask_claude(messages, system=None):
@@ -918,7 +969,7 @@ def ask_claude(messages, system=None):
     parts.append("[Assistant]\n(reply below)")
     prompt = "\n\n".join(parts)
 
-    # Scoped to exactly these 8 scripts -- Claude cannot run arbitrary Bash
+    # Scoped to exactly these 10 scripts -- Claude cannot run arbitrary Bash
     # commands, only these specific invocations. Both "python3" and
     # "python" prefixes are allowlisted, but CRAFT_TOOLS_SYSTEM above tells
     # Claude to always use "python": on this Windows deployment "python3"
@@ -927,7 +978,7 @@ def ask_claude(messages, system=None):
     # see anthropics/claude-code#57946. Keeping the "python3" allowlist
     # entries around is harmless (they're just never used in practice) in
     # case a future machine's PATH ordering differs.
-    craft_tool_scripts = ["resolve_item.py", "get_recipe.py", "craft_plan.py", "request_craft.py", "label_machine.py", "request_scan.py", "unlabel_machine.py", "remove_recipe.py"]
+    craft_tool_scripts = ["resolve_item.py", "get_recipe.py", "craft_plan.py", "request_craft.py", "label_machine.py", "request_scan.py", "unlabel_machine.py", "remove_recipe.py", "mark_importer.py", "sort_pattern.py"]
     allowed_tools = []
     for script in craft_tool_scripts:
         allowed_tools.append(f"Bash(python3 tools/{script}:*)")
@@ -1932,6 +1983,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.handle_remove_recipe()
             return
 
+        if self.path == "/mark_importer":
+            self.handle_mark_importer()
+            return
+
+        if self.path == "/sort_pattern":
+            self.handle_sort_pattern()
+            return
+
         if self.path != "/chat":
             self.send_json(404, {"error": "use POST /chat"})
             return
@@ -2251,6 +2310,29 @@ class Handler(http.server.BaseHTTPRequestHandler):
                           f"Its pattern: in: {in_desc} -> out: {out_desc}. Which machine is this for?")
             print(f"[machine-label] {prompt_msg}")
             append_log("claude", prompt_msg)
+        elif machine_name == WILDCARD_MACHINE:
+            # The importer interface -- see the pending_sorts section's
+            # comment for why this is a per-PATTERN prompt/learn cycle,
+            # not the normal per-INTERFACE one. Only fires on a genuinely
+            # new/changed slot (same is_new/is_changed signal as the
+            # normal path) so an unchanged pattern sitting there across
+            # repeated scans doesn't re-prompt every time.
+            if is_new or is_changed:
+                sort_id = uuid.uuid4().hex[:10]
+                with pending_sorts_lock:
+                    pending_sorts[sort_id] = {
+                        "interface_address": addr,
+                        "interface_label"  : label,
+                        "pattern_index"    : idx,
+                        "inputs"           : inputs,
+                        "outputs"          : outputs,
+                        "requested_at"     : now,
+                    }
+                    save_pending_sorts()
+                sort_msg = (f"New pattern on the importer interface \"{label}\": "
+                            f"in: {in_desc} -> out: {out_desc}. Which machine is this for? (sort_id: {sort_id})")
+                print(f"[importer] {sort_msg}")
+                append_log("claude", sort_msg)
         elif machine_name and (is_new or is_changed):
             learned_item = save_learned_recipe(machine_name, inputs, outputs)
             if learned_item:
@@ -2415,6 +2497,132 @@ class Handler(http.server.BaseHTTPRequestHandler):
         append_log("claude", msg)
         self.send_json(200, {"status": "ok", "machine": machine, "item": item,
                               "removed_recipes": removed, "affected_items": affected})
+
+    # ── mark an interface as the shared wildcard importer ───────────
+    def handle_mark_importer(self):
+        """Called by tools/mark_importer.py. Marks an already-seen interface
+        (same precondition as /label_machine -- it must have shown up in at
+        least one pattern scan already, otherwise there's no interface_label
+        to store) as the wildcard importer: instead of being permanently
+        tied to one machine, every new/changed pattern reported on it from
+        now on triggers its own per-pattern "which machine is this for?"
+        prompt (see handle_report_pattern's WILDCARD_MACHINE branch),
+        resolved individually via /sort_pattern -- it never learns a
+        recipe under the literal importer "machine" itself, since it isn't
+        a real, craftable machine.
+
+        Retroactively queues a sort prompt for every pattern already on
+        record for this interface (mirrors /label_machine's retroactive
+        learn loop, but queues pending_sorts instead of learning directly,
+        since -- unlike a normal machine -- we have no single answer for
+        what machine ALL of this interface's patterns belong to)."""
+        data, err = self._read_json_body()
+        if err:
+            self.send_json(400, {"error": err})
+            return
+
+        addr = data.get("interface_address")
+        if not addr:
+            self.send_json(400, {"error": "missing interface_address"})
+            return
+
+        with interface_meta_lock:
+            entry = interface_meta.get(addr)
+            if not entry:
+                self.send_json(404, {
+                    "error": "unknown interface_address -- it needs to show up in a pattern "
+                              "scan (scan_patterns_oc.lua) before it can be marked",
+                })
+                return
+            if entry.get("machine") == WILDCARD_MACHINE:
+                self.send_json(400, {"error": "this interface is already marked as the importer"})
+                return
+            entry["machine"] = WILDCARD_MACHINE
+            entry["labeled_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+            try:
+                save_interface_meta()
+            except Exception as e:
+                print(f"[machine-label][err] failed to save interface_meta.json: {e}")
+                append_log("error", f"failed to save interface_meta.json: {e}")
+                self.send_json(500, {"error": str(e)})
+                return
+
+        label = entry.get("interface_label") or addr[:8]
+        print(f"[importer] interface \"{label}\" marked as the wildcard importer")
+        append_log("claude", f"Got it -- interface \"{label}\" is now the wildcard importer. "
+                              f"Any pattern placed there will get asked about individually.")
+
+        # queue a sort prompt for every pattern already known on this
+        # interface (e.g. if it held patterns before being marked)
+        with known_patterns_lock:
+            prior_patterns = [(k, p) for k, p in known_patterns.items() if k.startswith(f"{addr}#")]
+        queued = []
+        for key, p in prior_patterns:
+            sort_id = uuid.uuid4().hex[:10]
+            with pending_sorts_lock:
+                pending_sorts[sort_id] = {
+                    "interface_address": addr,
+                    "interface_label"  : label,
+                    "pattern_index"    : p.get("pattern_index"),
+                    "inputs"           : p.get("inputs", []),
+                    "outputs"          : p.get("outputs", []),
+                    "requested_at"     : time.strftime("%Y-%m-%d %H:%M:%S"),
+                }
+                save_pending_sorts()
+            queued.append(sort_id)
+        if queued:
+            print(f"[importer] queued {len(queued)} pre-existing pattern(s) for sorting")
+            append_log("claude", f"Also found {len(queued)} pattern(s) already on that interface -- "
+                                  f"I'll ask about each one.")
+
+        self.send_json(200, {"status": "ok", "interface_address": addr, "queued_sorts": queued})
+
+    # ── resolve one pending importer sort ────────────────────────────
+    def handle_sort_pattern(self):
+        """Called by tools/sort_pattern.py once the player answers a "which
+        machine is this for?" prompt from the importer interface. Learns
+        the pending pattern under the given machine name (exactly like the
+        normal per-interface learning path) and clears the pending entry.
+        404 if sort_id is unknown or was already resolved -- pending_sorts
+        entries are popped, not left around, so answering the same sort_id
+        twice fails cleanly on the second attempt rather than double-
+        learning the recipe."""
+        data, err = self._read_json_body()
+        if err:
+            self.send_json(400, {"error": err})
+            return
+
+        sort_id = data.get("sort_id")
+        machine = data.get("machine")
+        if not sort_id or not machine:
+            self.send_json(400, {"error": "missing sort_id or machine"})
+            return
+
+        with pending_sorts_lock:
+            entry = pending_sorts.pop(sort_id, None)
+            if entry is not None:
+                try:
+                    save_pending_sorts()
+                except Exception as e:
+                    pending_sorts[sort_id] = entry  # put it back, save failed
+                    print(f"[importer][err] failed to save pending_sorts.json: {e}")
+                    append_log("error", f"failed to save pending_sorts.json: {e}")
+                    self.send_json(500, {"error": str(e)})
+                    return
+        if entry is None:
+            self.send_json(404, {"error": "unknown or already-resolved sort_id"})
+            return
+
+        learned_item = save_learned_recipe(machine, entry.get("inputs", []), entry.get("outputs", []))
+        in_desc  = ", ".join(describe_item(e) for e in entry.get("inputs", []))  or "(none)"
+        out_desc = ", ".join(describe_item(e) for e in entry.get("outputs", [])) or "(none)"
+        if learned_item:
+            msg = f"Sorted: in: {in_desc} -> out: {out_desc} learned as a recipe for {machine}."
+        else:
+            msg = f"Couldn't learn that pattern for {machine} -- it had no output to key it on."
+        print(f"[importer] {msg}")
+        append_log("claude", msg)
+        self.send_json(200, {"status": "ok", "sort_id": sort_id, "machine": machine, "learned_item": learned_item})
 
     # ── item label scan endpoint ─────────────────────────────────
     def handle_report_labels(self):
@@ -2677,6 +2885,7 @@ if __name__ == "__main__":
     load_pending_jobs()
     load_pending_scans()
     load_interface_meta()
+    load_pending_sorts()
 
     # ThreadingHTTPServer, not plain HTTPServer: handle_upload_recipe_image()
     # blocks on a `claude -p` subprocess for up to 120s (vision extraction is
