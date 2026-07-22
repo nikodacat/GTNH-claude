@@ -57,7 +57,7 @@ local computer  = require("computer")
 local io        = require("io")
 local os        = require("os")
 
-local DISK = "/mnt/dc6"   -- where scripts + config live
+local DISK = "/home"   -- where scripts + config live (was /mnt/dc6 -- moved to /home, stable across disk swaps)
 
 -- ── local config (NOT tracked in git) ─────────
 -- Copy config.example.lua to DISK.."/config.lua" and set your
