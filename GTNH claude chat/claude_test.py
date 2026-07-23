@@ -31,6 +31,7 @@
 #    POST /sort_pattern         -- Claude (via tools/sort_pattern.py) resolves a pending importer sort into a learned recipe
 #    POST /describe_machine     -- Claude (via tools/describe_machine.py) writes/updates a machine's free-text description
 #    GET  /machine_recipes      -- Claude (via tools/machine_recipes.py) lists a machine's known recipes + its description
+#    GET  /recent_scans         -- Claude (via tools/recent_scans.py) lists recent structured scan-pipeline events
 # =============================================
 
 import http.server
@@ -462,6 +463,54 @@ def save_pending_scans():
     with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(pending_scans, f, ensure_ascii=False, indent=2)
     os.replace(tmp_path, PENDING_SCANS_PATH)
+
+
+# ── recent scan-event feed (scan_events.json) ───────────────────────────
+# User's ask (2026-07-23): "store the recent scan event for AI to have a
+# knowledge of what going on in recent scan." Every meaningful scan signal
+# (new/changed pattern, unidentified machine flagged, importer sort
+# pending, recipe learned, scan requested/completed/failed) ALREADY gets
+# an append_log() call for the player-visible chat log -- but that's one
+# big feed of freeform text (and the OC-side [WARN]/dbg lines specifically
+# only ever reach it as one giant blob via /log, not as discrete events).
+# This is a SEPARATE, structured, capped log of just the scan-pipeline
+# events themselves, so a tool call can cleanly answer "what happened in
+# recent scans" without parsing prose out of the general chat history.
+SCAN_EVENTS_PATH = "scan_events.json"
+SCAN_EVENTS_MAX = 200  # rolling cap -- a recent-activity feed, not a permanent audit log (recipe_db.json/known_patterns.json already are that)
+scan_events = []  # list of {time, event, ...fields}, oldest first (append order)
+scan_events_lock = threading.Lock()
+
+def load_scan_events():
+    global scan_events
+    if not os.path.exists(SCAN_EVENTS_PATH):
+        print(f"[~] {SCAN_EVENTS_PATH} not found -- starting with an empty scan-event log.")
+        return
+    with open(SCAN_EVENTS_PATH, "r", encoding="utf-8") as f:
+        scan_events = json.load(f)
+    print(f"[~] Loaded scan_events.json: {len(scan_events):,} recent scan event(s) on record.")
+
+def save_scan_events():
+    """Write scan_events back to disk. Caller must hold scan_events_lock."""
+    tmp_path = SCAN_EVENTS_PATH + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(scan_events, f, ensure_ascii=False, indent=2)
+    os.replace(tmp_path, SCAN_EVENTS_PATH)
+
+def record_scan_event(event, **fields):
+    """Append one structured scan event, dropping the oldest once past
+    SCAN_EVENTS_MAX. Acquires scan_events_lock itself -- callers must NOT
+    already hold it (this file's convention is to never nest locks; see
+    get_known_machine_names()'s comment for the same rule elsewhere)."""
+    entry = {"time": time.strftime("%Y-%m-%d %H:%M:%S"), "event": event, **fields}
+    with scan_events_lock:
+        scan_events.append(entry)
+        if len(scan_events) > SCAN_EVENTS_MAX:
+            del scan_events[:len(scan_events) - SCAN_EVENTS_MAX]
+        try:
+            save_scan_events()
+        except Exception as e:
+            print(f"[scan-events][err] failed to save scan_events.json: {e}")
 
 
 # ── machine identity tracking (interface_meta.json) ────────────────────
@@ -995,7 +1044,7 @@ def check_claude():
 # their own context. See tools/*.py for the actual scripts -- each is a
 # thin wrapper around an existing server endpoint, so there's exactly
 # one implementation of each lookup no matter who calls it.
-CRAFT_TOOLS_SYSTEM = """You have access to twelve command-line tools (run them with your Bash tool, exactly as shown -- nothing else is permitted):
+CRAFT_TOOLS_SYSTEM = """You have access to thirteen command-line tools (run them with your Bash tool, exactly as shown -- nothing else is permitted):
   python tools/resolve_item.py <name>              -- resolve an item name/label (English or otherwise -- translate it yourself first if needed) to candidate item ids
   python tools/get_recipe.py <item_id>              -- look up recipe_db.json recipes for an exact item id
   python tools/machine_recipes.py <machine name> [limit] -- list all recipes learned for a specific machine (e.g. "Assembly Line"); limit defaults to 100
@@ -1008,6 +1057,7 @@ CRAFT_TOOLS_SYSTEM = """You have access to twelve command-line tools (run them w
   python tools/mark_importer.py <interface_address> -- mark an interface as the shared wildcard importer (see below)
   python tools/sort_pattern.py <sort_id> <machine name> -- resolve a pending importer sort prompt (see below)
   python tools/describe_machine.py "<machine name>" "<description>" -- write/update a machine's free-text description (see below; BOTH args must be quoted)
+  python tools/recent_scans.py [limit]              -- list recent structured scan-pipeline events (see below); limit defaults to 20
 
 IMPORTANT: always run these with `python`, never `python3`. On this machine, `python3` resolves to a broken Windows Store redirect stub that silently exits with no output whenever it's run non-interactively -- it will look like the tool did nothing, with no error to explain why. `python` is the one that actually works.
 
@@ -1040,7 +1090,11 @@ About mark_importer.py and sort_pattern.py -- the shared "wildcard" interface:
 About describe_machine.py and machine_recipes.py -- giving machines real context:
 - Any machine can have a short free-text description attached, written by either you or the player, so future conversations about it are fluent instead of generic. Good moments to write or update one: right after learning a machine's first recipe (summarize what it makes and roughly what it needs, e.g. "Circuit Assembler: makes basic circuit boards from copper + redstone, LV-MV tier"), or whenever the player tells you something worth remembering about a specific machine (its location, its role in their base, a quirk, etc.). Don't ask permission first for the routine "just learned a recipe" case -- just write a short, factual note and mention in passing that you did; DO check with the player before overwriting an existing description with something substantially different, since it might have been written for a reason you don't know.
 - Call describe_machine.py with the machine name and the description, BOTH quoted as separate arguments (e.g. describe_machine.py "Circuit Assembler" "Makes circuit boards from copper + redstone, LV-MV tier"). Same known-machine matching as sort_pattern.py -- an unrecognized name comes back as {"status": "unknown_machine", "did_you_mean": ..., "known_machines": [...]} and saves nothing; use the corrected/suggested name and call again. Overwrites any existing description outright -- there's no history, so don't call this for a machine whose note you haven't actually reviewed first if you're not sure what's already there.
-- Call machine_recipes.py <machine name> whenever a player asks something like "what does my Assembler do again?", "what can X machine make?", or references a machine by name generally rather than asking about one specific item -- it returns BOTH the stored description AND every recipe learned for that machine in one call, so you don't need get_recipe.py's single-item lookup for this kind of broader question. If description is null, nothing's been written yet -- consider writing one from the returned recipes if there are any, or just say no notes exist yet."""
+- Call machine_recipes.py <machine name> whenever a player asks something like "what does my Assembler do again?", "what can X machine make?", or references a machine by name generally rather than asking about one specific item -- it returns BOTH the stored description AND every recipe learned for that machine in one call, so you don't need get_recipe.py's single-item lookup for this kind of broader question. If description is null, nothing's been written yet -- consider writing one from the returned recipes if there are any, or just say no notes exist yet.
+
+About recent_scans.py -- knowing what happened in recent scans without being told:
+- Call this whenever a player asks something like "what happened in the last scan?", "did the scan find anything?", "what's going on with scanning lately?", or right after you yourself just queued a scan with request_scan.py and want to check on it a bit later in the conversation. Each event has a "time" and an "event" type: scan_requested/scan_completed/scan_failed (a full scan run, with "details" on completion/failure), pattern_new/pattern_changed (a specific pattern slot's contents, with "interface_label"/"pattern_index"/"inputs"/"outputs"), unknown_machine (a not-yet-labeled interface was found, with the same fields plus "interface_address" -- use that address with label_machine.py if the player answers), importer_pending_sort (a pattern is waiting on the wildcard importer for a "which machine" answer, with "sort_id"), and recipe_learned (a recipe was actually saved, with "machine").
+- This is a recent-activity feed (capped at the last 200 events), not the permanent record -- for a specific machine's full recipe list, use machine_recipes.py instead; for "did we ever learn X item," use get_recipe.py. Use recent_scans.py for "what's been happening lately" style questions, not as a general recipe lookup."""
 
 # ── call claude -p ────────────────────────────────────────────
 def ask_claude(messages, system=None):
@@ -1053,7 +1107,7 @@ def ask_claude(messages, system=None):
     parts.append("[Assistant]\n(reply below)")
     prompt = "\n\n".join(parts)
 
-    # Scoped to exactly these 12 scripts -- Claude cannot run arbitrary Bash
+    # Scoped to exactly these 13 scripts -- Claude cannot run arbitrary Bash
     # commands, only these specific invocations. Both "python3" and
     # "python" prefixes are allowlisted, but CRAFT_TOOLS_SYSTEM above tells
     # Claude to always use "python": on this Windows deployment "python3"
@@ -1062,7 +1116,7 @@ def ask_claude(messages, system=None):
     # see anthropics/claude-code#57946. Keeping the "python3" allowlist
     # entries around is harmless (they're just never used in practice) in
     # case a future machine's PATH ordering differs.
-    craft_tool_scripts = ["resolve_item.py", "get_recipe.py", "machine_recipes.py", "craft_plan.py", "request_craft.py", "label_machine.py", "request_scan.py", "unlabel_machine.py", "remove_recipe.py", "mark_importer.py", "sort_pattern.py", "describe_machine.py"]
+    craft_tool_scripts = ["resolve_item.py", "get_recipe.py", "machine_recipes.py", "craft_plan.py", "request_craft.py", "label_machine.py", "request_scan.py", "unlabel_machine.py", "remove_recipe.py", "mark_importer.py", "sort_pattern.py", "describe_machine.py", "recent_scans.py"]
     allowed_tools = []
     for script in craft_tool_scripts:
         allowed_tools.append(f"Bash(python3 tools/{script}:*)")
@@ -2042,6 +2096,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         print(f"[scan-job][err] failed to save pending_scans.json: {e}")
                     self.send_json(200, {"scan": scan})
 
+        elif self.path.startswith("/recent_scans"):
+            # Claude (via tools/recent_scans.py) -- structured recent scan
+            # activity, see scan_events.json's comment above for why this
+            # is separate from the general chat_log/append_log feed.
+            # Newest first, capped by `limit` (default 20, 0/negative
+            # means "everything currently on record" -- bounded anyway by
+            # SCAN_EVENTS_MAX).
+            limit = 20
+            if "limit=" in self.path:
+                try: limit = int(self.path.split("limit=")[1].split("&")[0])
+                except: limit = 20
+            with scan_events_lock:
+                recent = list(scan_events[-limit:]) if limit > 0 else list(scan_events)
+            recent.reverse()
+            self.send_json(200, {"count": len(recent), "events": recent})
+
         else:
             self.send_json(404, {"error": "not found"})
 
@@ -2393,6 +2463,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                    f"  out: {out_desc}")
             print(f"[pattern-scan] {msg}")
             append_log("diag", msg)
+            record_scan_event("pattern_new" if is_new else "pattern_changed",
+                               interface_address=addr, interface_label=label,
+                               pattern_index=idx, inputs=in_desc, outputs=out_desc)
 
         # ── unidentified-machine detection + recipe learning ──────
         # Independent of is_new/is_changed's diag message above -- these
@@ -2450,6 +2523,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                           f"Its pattern: in: {in_desc} -> out: {out_desc}. Which machine is this for?")
             print(f"[machine-label] {prompt_msg}")
             append_log("claude", prompt_msg)
+            record_scan_event("unknown_machine", interface_address=addr, interface_label=label,
+                               inputs=in_desc, outputs=out_desc)
         elif machine_name == WILDCARD_MACHINE:
             # The importer interface -- see the pending_sorts section's
             # comment for why this is a per-PATTERN prompt/learn cycle,
@@ -2473,12 +2548,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
                             f"in: {in_desc} -> out: {out_desc}. Which machine is this for? (sort_id: {sort_id})")
                 print(f"[importer] {sort_msg}")
                 append_log("claude", sort_msg)
+                record_scan_event("importer_pending_sort", interface_label=label, sort_id=sort_id,
+                                   inputs=in_desc, outputs=out_desc)
         elif machine_name and (is_new or is_changed):
             learned_item = save_learned_recipe(machine_name, inputs, outputs)
             if learned_item:
                 learn_msg = f"Learned a new recipe for {machine_name}: in: {in_desc} -> out: {out_desc}"
                 print(f"[recipe-import] {learn_msg}")
                 append_log("claude", learn_msg)
+                record_scan_event("recipe_learned", machine=machine_name, interface_address=addr,
+                                   interface_label=label, inputs=in_desc, outputs=out_desc)
 
         self.send_json(200, {"status": "ok", "new": is_new, "changed": is_changed})
 
@@ -3057,6 +3136,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 append_log("error", f"failed to save pending_scans.json: {e}")
 
         append_log("diag", f"Pattern scan queued (scan {scan_id}) -- waiting for the scanning computer to pick it up.")
+        record_scan_event("scan_requested", scan_id=scan_id)
         self.send_json(200, {"queued": True, "scan_id": scan_id})
 
     def handle_report_scan_result(self):
@@ -3091,6 +3171,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         msg = f"Pattern scan {scan_id} {verb}: {details}" if details else f"Pattern scan {scan_id} {verb}."
         print(f"[scan-job] {msg}")
         append_log("claude", msg)
+        record_scan_event("scan_completed" if success else "scan_failed", scan_id=scan_id, details=details)
         self.send_json(200, {"status": "ok"})
 
 # ── main ──────────────────────────────────────────────────────
@@ -3105,6 +3186,7 @@ if __name__ == "__main__":
     load_item_labels()
     load_pending_jobs()
     load_pending_scans()
+    load_scan_events()
     load_interface_meta()
     load_pending_sorts()
     load_machine_notes()
