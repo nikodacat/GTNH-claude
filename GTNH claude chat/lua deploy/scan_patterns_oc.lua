@@ -378,10 +378,30 @@ local function scanInterface(addr)
 
   local foundAny = false
   local occupiedCount = 0
+  -- DIAGNOSTIC 2026-07-24: this used to only check "did getInterfacePattern
+  -- return something truthy" and silently discarded WHY it didn't --
+  -- indistinguishable in the log between "this slot genuinely has no
+  -- pattern" (the normal, expected case for most of the 0-9 sweep) and
+  -- "the call actually threw an exception trying to read it" (a real
+  -- problem worth knowing about). Confirmed live 2026-07-24: a player
+  -- reported two interfaces (with real Encoded Patterns placed in their
+  -- pattern slots, fully channeled, no stocking-config confusion) still
+  -- scanning as "no occupied pattern slots found" -- with the old code
+  -- there was no way to tell whether AE2 genuinely saw no pattern there
+  -- or whether something was silently erroring on every probe. Now
+  -- captures pcall's actual error text per index and, if the interface
+  -- ends up reporting zero occupied slots AND at least one probe threw a
+  -- real error (as opposed to cleanly returning nil/false), logs those
+  -- errors explicitly instead of staying silent.
+  local probeErrors = {}
   -- see INDEXING CAVEAT: 0..9 is a superset of both a 0-based 0-8
   -- range and a 1-based 1-9 range (9 pattern slots per interface).
   for patternIndex = 0, 9 do
     local ok2, pattern = pcall(proxy.getInterfacePattern, patternIndex)
+    if not ok2 then
+      -- pcall's second return value is the error message when the call itself threw
+      probeErrors[#probeErrors+1] = string.format("index %d: threw %s", patternIndex, tostring(pattern))
+    end
     if ok2 and pattern then
       foundAny = true
       occupiedCount = occupiedCount + 1
@@ -479,6 +499,13 @@ local function scanInterface(addr)
   end
   if not foundAny then
     dbg("  interface "..label..": no occupied pattern slots found")
+    if #probeErrors > 0 then
+      dbg(string.format("    [DIAG] getInterfacePattern threw a real error on %d of the 10 probed indices "
+        .."(not just \"no pattern here\" -- something is actually failing):", #probeErrors))
+      for _, e in ipairs(probeErrors) do
+        dbg("      "..e)
+      end
+    end
   end
 
   -- Report presence unconditionally (occupied or not) -- see the
