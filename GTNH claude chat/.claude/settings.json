@@ -3,6 +3,7 @@
     "allow": [
       "Bash(python tools/resolve_item.py:*)",
       "Bash(python tools/get_recipe.py:*)",
+      "Bash(python tools/machine_recipes.py:*)",
       "Bash(python tools/craft_plan.py:*)",
       "Bash(python tools/request_craft.py:*)",
       "Bash(python tools/label_machine.py:*)",
@@ -11,8 +12,10 @@
       "Bash(python tools/remove_recipe.py:*)",
       "Bash(python tools/mark_importer.py:*)",
       "Bash(python tools/sort_pattern.py:*)",
+      "Bash(python tools/describe_machine.py:*)",
       "Bash(python3 tools/resolve_item.py:*)",
       "Bash(python3 tools/get_recipe.py:*)",
+      "Bash(python3 tools/machine_recipes.py:*)",
       "Bash(python3 tools/craft_plan.py:*)",
       "Bash(python3 tools/request_craft.py:*)",
       "Bash(python3 tools/label_machine.py:*)",
@@ -21,6 +24,7 @@
       "Bash(python3 tools/remove_recipe.py:*)",
       "Bash(python3 tools/mark_importer.py:*)",
       "Bash(python3 tools/sort_pattern.py:*)",
+      "Bash(python3 tools/describe_machine.py:*)",
       "Read"
     ]
   },
