@@ -249,10 +249,27 @@ if not component.isAvailable("database") then
 end
 local db = component.database
 
-local interfaces = {}
-for addr in component.list("me_interface") do
-  interfaces[#interfaces+1] = addr
+-- BUG FIX 2026-07-24: this used to be captured ONCE here at script
+-- startup and never touched again, so `runFullScan()` kept scanning the
+-- exact same address list for the script's entire lifetime -- any
+-- me_interface added to the network (new Adapter wired up, new machine
+-- brought online) AFTER this script last started was invisible to every
+-- scan until the script itself was restarted. Confirmed live: a player
+-- added a new interface (address b6b51d77) and it never once showed up
+-- in any scan, while the two interfaces present at startup kept getting
+-- scanned normally scan after scan. Fixed by making this a function,
+-- called fresh at the top of every runFullScan() (see below) instead of
+-- a value computed once and reused forever -- still used here too, for
+-- the one-time startup hardware sanity check.
+local function getInterfaceList()
+  local list = {}
+  for addr in component.list("me_interface") do
+    list[#list+1] = addr
+  end
+  return list
 end
+
+local interfaces = getInterfaceList()
 if #interfaces == 0 then
   dbg("[FAIL] no me_interface components found.")
   dbg("       Each ME Interface you want scanned needs its own OC")
@@ -261,7 +278,7 @@ if #interfaces == 0 then
   flushDebug("hw-fail")
   io.read(); return
 end
-dbg(string.format("[OK] found %d me_interface component(s)", #interfaces))
+dbg(string.format("[OK] found %d me_interface component(s) at startup", #interfaces))
 flushDebug("hw-ok")
 
 -- ── scratch database slot used to read one item at a time ──
@@ -480,7 +497,15 @@ local SCAN_POLL_INTERVAL = 10  -- seconds between checking for a scan request
 
 local function runFullScan()
   dbg("=== ME Interface Pattern Scan ===")
-  for _, addr in ipairs(interfaces) do
+  -- Re-enumerate fresh every run (see getInterfaceList()'s 2026-07-24 bug
+  -- note above) instead of the stale startup-only `interfaces` list --
+  -- picks up any me_interface added to the network since the script
+  -- started, without needing a restart.
+  local current = getInterfaceList()
+  if #current ~= #interfaces then
+    dbg(string.format("  (me_interface count changed since startup: %d -> %d)", #interfaces, #current))
+  end
+  for _, addr in ipairs(current) do
     scanInterface(addr)
   end
   dbg("=== Scan complete ===")
