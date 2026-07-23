@@ -308,9 +308,17 @@ end
 --      MEPatternSlot name already returned for this canonical slot by
 --      getInterfacePattern -- a mismatch means we hit a real item, but
 --      the wrong one, so we keep trying rather than accepting it.
+-- Returns (item, nil) on success, or (nil, lastErr) on failure -- lastErr is
+-- a short human-readable reason for the LAST candidate tried, kept purely
+-- for diagnostics (see scanInterface()'s dbg call below). Previously this
+-- discarded pcall's error entirely, so a genuine engine-side failure and a
+-- simple wrong-index guess were indistinguishable in the log -- this cost
+-- real time on 2026-07-23 when 6 of 9 input slots on a large recipe failed
+-- to read back with no clue why.
 local function storeSlot(storeFn, patternIndex, k, expectedName)
   local candidates = {k}
   if k - 1 >= 0 then candidates[#candidates+1] = k - 1 end
+  local lastErr = nil
   for _, idx in ipairs(candidates) do
     pcall(db.clear, SCRATCH_SLOT)
     local callOk, stored = pcall(storeFn, patternIndex, idx, db.address, SCRATCH_SLOT)
@@ -323,10 +331,18 @@ local function storeSlot(storeFn, patternIndex, k, expectedName)
           count  = item.size or 1,
           label  = item.label or item.name,
         }
+      elseif okGet and item then
+        lastErr = "name mismatch (got \""..tostring(item.label).."\")"
+      else
+        lastErr = "db.get failed: "..tostring(item)
       end
+    elseif not callOk then
+      lastErr = "storeFn threw: "..tostring(stored)
+    else
+      lastErr = "storeFn returned false (no such index)"
     end
   end
-  return nil
+  return nil, lastErr
 end
 
 -- ── scan one interface ───────────────────────────
@@ -366,11 +382,23 @@ local function scanInterface(addr)
       -- of the pattern's real amount. Use the pattern slot's own
       -- .count as the real quantity; only fall back to storeSlot's
       -- value (then 1) if it's missing for some reason.
+      -- os.sleep(0) after every slot probe below: storeSlot() burns up to 2
+      -- real component calls' worth of db.clear/storeFn/db.get per index
+      -- candidate it tries, with zero yields in between. OC enforces a
+      -- per-tick direct-call budget before it forces (or breaks) a yield;
+      -- a 9-input pattern probed back-to-back can plausibly exhaust that
+      -- budget partway through, silently failing every storeFn call for
+      -- the rest of the synchronous loop -- which matches exactly what was
+      -- observed on 2026-07-23: input slots 1-3 read fine, 4-9 all failed,
+      -- then output slot 3 (the first output probed after 9 input probes)
+      -- also failed. Yielding once per slot resets the budget so it can't
+      -- accumulate across a whole pattern. Cheap: sleep(0) yields without
+      -- an enforced real-time delay.
       local inputs, outputs = {}, {}
       for k = 1, #rawInputs do
         local slotData = rawInputs[k]
         local expected = slotData and slotData.name
-        local item = storeSlot(proxy.storeInterfacePatternInput, patternIndex, k, expected)
+        local item, probeErr = storeSlot(proxy.storeInterfacePatternInput, patternIndex, k, expected)
         if item then
           item.index = k
           local realCount = slotData and slotData.count
@@ -382,13 +410,15 @@ local function scanInterface(addr)
           inputs[#inputs+1] = item
         else
           dbg("    [WARN] could not read back input slot "..k.." (tried both index conventions"
-              ..(expected and (", expected name ~= \""..tostring(expected).."\"") or "")..")")
+              ..(expected and (", expected name ~= \""..tostring(expected).."\"") or "")
+              ..(probeErr and (" -- "..tostring(probeErr)) or "")..")")
         end
+        os.sleep(0)
       end
       for k = 1, #rawOutputs do
         local slotData = rawOutputs[k]
         local expected = slotData and slotData.name
-        local item = storeSlot(proxy.storeInterfacePatternOutput, patternIndex, k, expected)
+        local item, probeErr = storeSlot(proxy.storeInterfacePatternOutput, patternIndex, k, expected)
         if item then
           item.index = k
           local realCount = slotData and slotData.count
@@ -400,8 +430,15 @@ local function scanInterface(addr)
           outputs[#outputs+1] = item
         else
           dbg("    [WARN] could not read back output slot "..k.." (tried both index conventions"
-              ..(expected and (", expected name ~= \""..tostring(expected).."\"") or "")..")")
+              ..(expected and (", expected name ~= \""..tostring(expected).."\"") or "")
+              ..(probeErr and (" -- "..tostring(probeErr)) or "")..")")
         end
+        os.sleep(0)
+      end
+      if #inputs < #rawInputs or #outputs < #rawOutputs then
+        dbg(string.format("    [WARN] pattern reported INCOMPLETE: got %d/%d input(s), %d/%d output(s) -- "
+          .."recipe saved will be missing ingredients, re-scan or fix manually if this recurs",
+          #inputs, #rawInputs, #outputs, #rawOutputs))
       end
 
       if #inputs == 0 and #outputs == 0 then
@@ -449,22 +486,51 @@ local function runFullScan()
   dbg("=== Scan complete ===")
 end
 
+-- Repeat-suppression for persistent poll failures -- 2026-07-23: a stale
+-- server process (missing the /next_scan endpoint entirely, or some other
+-- sustained outage) had this dbg-ing an identical "malformed"/"failed"
+-- line every ~10s for ~17 hours straight, same class of spam already fixed
+-- for craft_oc.lua's /next_job poll (that fix only silenced the routine
+-- per-request HTTP tracing via a `quiet` flag though -- it never covered a
+-- SUSTAINED identical failure, which would spam there too if it recurred).
+-- Logs the first occurrence immediately, then only every 100th repeat
+-- after that (so a real outage still leaves a trail, just not a flood),
+-- and resets the moment a healthy response comes back.
+local lastPollProblem = nil
+local lastPollProblemCount = 0
+local function reportPollProblem(msg)
+  if msg == lastPollProblem then
+    lastPollProblemCount = lastPollProblemCount + 1
+    if lastPollProblemCount % 100 == 0 then
+      dbg("scan-poll: (still failing, "..lastPollProblemCount.." consecutive) "..msg)
+      flushDebug("scan-poll-repeat")
+    end
+    return
+  end
+  lastPollProblem = msg
+  lastPollProblemCount = 1
+  dbg("scan-poll: "..msg)
+  flushDebug("scan-poll-problem")
+end
+
 local function checkForScanRequest()
   local raw, err = getJson("/next_scan")
   if not raw then
-    dbg("scan-poll: /next_scan failed: "..(err or "?"))
+    reportPollProblem("/next_scan failed: "..(err or "?"))
     return
   end
   if raw:find('"scan"%s*:%s*null') then
+    lastPollProblem, lastPollProblemCount = nil, 0  -- healthy -- next failure logs immediately
     return  -- nothing queued right now
   end
 
   local scanId = extractStr(raw, "id")
   if not scanId then
-    dbg("scan-poll: malformed /next_scan response: "..raw:sub(1,200))
+    reportPollProblem("malformed /next_scan response: "..raw:sub(1,200))
     return
   end
 
+  lastPollProblem, lastPollProblemCount = nil, 0
   dbg("scan-poll: claimed scan request "..scanId)
   runFullScan()
   flushDebug("scan-complete")
