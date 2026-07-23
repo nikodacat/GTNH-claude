@@ -13,6 +13,7 @@
       "Bash(python tools/mark_importer.py:*)",
       "Bash(python tools/sort_pattern.py:*)",
       "Bash(python tools/describe_machine.py:*)",
+      "Bash(python tools/recent_scans.py:*)",
       "Bash(python3 tools/resolve_item.py:*)",
       "Bash(python3 tools/get_recipe.py:*)",
       "Bash(python3 tools/machine_recipes.py:*)",
@@ -25,6 +26,7 @@
       "Bash(python3 tools/mark_importer.py:*)",
       "Bash(python3 tools/sort_pattern.py:*)",
       "Bash(python3 tools/describe_machine.py:*)",
+      "Bash(python3 tools/recent_scans.py:*)",
       "Read"
     ]
   },
