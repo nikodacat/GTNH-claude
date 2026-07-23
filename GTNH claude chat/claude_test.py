@@ -32,6 +32,8 @@
 #    POST /describe_machine     -- Claude (via tools/describe_machine.py) writes/updates a machine's free-text description
 #    GET  /machine_recipes      -- Claude (via tools/machine_recipes.py) lists a machine's known recipes + its description
 #    GET  /recent_scans         -- Claude (via tools/recent_scans.py) lists recent structured scan-pipeline events
+#    POST /report_interface_seen -- scan_patterns_oc.lua reports EVERY interface it looked at, occupied or not (silent bookkeeping)
+#    GET  /status                -- Claude (via tools/status.py) aggregate dashboard numbers (machines, recipes, queues, scanner visibility)
 # =============================================
 
 import http.server
@@ -604,6 +606,49 @@ def save_interface_meta():
     os.replace(tmp_path, INTERFACE_META_PATH)
 
 
+# ── raw interface presence (seen_interfaces.json) ───────────────────────
+# Fixes a real gap found 2026-07-24: interface_meta above (and every
+# unidentified-machine/labeling flow built on it) only ever learns an
+# interface exists once handle_report_pattern() sees an actual OCCUPIED
+# pattern on it -- a real, connected, powered-on me_interface with
+# nothing encoded in any of its slots yet produces NO /report_pattern
+# call at all (scan_patterns_oc.lua just dbg()s "no occupied pattern
+# slots found" locally and moves on), so the server had no record of it
+# whatsoever. From Claude's side this was indistinguishable from "not
+# wired up to the network at all" -- leading to it wrongly guessing about
+# cables/power/channels when a player asked why a new machine wasn't
+# showing up, when the real answer was just "the interface IS visible,
+# it just has no pattern in it yet."
+#
+# scan_patterns_oc.lua's scanInterface() now calls POST
+# /report_interface_seen unconditionally (occupied or not) at the end of
+# every interface it looks at, every scan. This is PURE bookkeeping --
+# no chat prompt, no machine-identity/labeling logic lives here, just a
+# record of "the scanner can currently see this address, and whether it
+# had any occupied pattern slots last time." Used by GET /status (see
+# handle_status below) to report seen-but-empty interfaces distinctly
+# from ones with no server-side record at all.
+SEEN_INTERFACES_PATH = "seen_interfaces.json"
+seen_interfaces = {}   # interface_address -> {interface_address, interface_label, occupied, pattern_count, last_seen}
+seen_interfaces_lock = threading.Lock()
+
+def load_seen_interfaces():
+    global seen_interfaces
+    if not os.path.exists(SEEN_INTERFACES_PATH):
+        print(f"[~] {SEEN_INTERFACES_PATH} not found -- starting with no interface presence on record.")
+        return
+    with open(SEEN_INTERFACES_PATH, "r", encoding="utf-8") as f:
+        seen_interfaces = json.load(f)
+    print(f"[~] Loaded seen_interfaces.json: {len(seen_interfaces):,} interface(s) seen by the scanner.")
+
+def save_seen_interfaces():
+    """Write seen_interfaces back to disk. Caller must hold seen_interfaces_lock."""
+    tmp_path = SEEN_INTERFACES_PATH + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(seen_interfaces, f, ensure_ascii=False, indent=2)
+    os.replace(tmp_path, SEEN_INTERFACES_PATH)
+
+
 # ── free-text machine descriptions (machine_notes.json) ────────────────
 # A short human- or Claude-written note per machine name -- "makes GT
 # circuit boards, tier LV-MV, uses the copper+redstone recipe", "this is
@@ -1044,7 +1089,7 @@ def check_claude():
 # their own context. See tools/*.py for the actual scripts -- each is a
 # thin wrapper around an existing server endpoint, so there's exactly
 # one implementation of each lookup no matter who calls it.
-CRAFT_TOOLS_SYSTEM = """You have access to thirteen command-line tools (run them with your Bash tool, exactly as shown -- nothing else is permitted):
+CRAFT_TOOLS_SYSTEM = """You have access to fourteen command-line tools (run them with your Bash tool, exactly as shown -- nothing else is permitted):
   python tools/resolve_item.py <name>              -- resolve an item name/label (English or otherwise -- translate it yourself first if needed) to candidate item ids
   python tools/get_recipe.py <item_id>              -- look up recipe_db.json recipes for an exact item id
   python tools/machine_recipes.py <machine name> [limit] -- list all recipes learned for a specific machine (e.g. "Assembly Line"); limit defaults to 100
@@ -1058,6 +1103,7 @@ CRAFT_TOOLS_SYSTEM = """You have access to thirteen command-line tools (run them
   python tools/sort_pattern.py <sort_id> <machine name> -- resolve a pending importer sort prompt (see below)
   python tools/describe_machine.py "<machine name>" "<description>" -- write/update a machine's free-text description (see below; BOTH args must be quoted)
   python tools/recent_scans.py [limit]              -- list recent structured scan-pipeline events (see below); limit defaults to 20
+  python tools/status.py                            -- aggregate dashboard numbers: total machines/recipes, queue sizes, scanner visibility (see below)
 
 IMPORTANT: always run these with `python`, never `python3`. On this machine, `python3` resolves to a broken Windows Store redirect stub that silently exits with no output whenever it's run non-interactively -- it will look like the tool did nothing, with no error to explain why. `python` is the one that actually works.
 
@@ -1094,7 +1140,11 @@ About describe_machine.py and machine_recipes.py -- giving machines real context
 
 About recent_scans.py -- knowing what happened in recent scans without being told:
 - Call this whenever a player asks something like "what happened in the last scan?", "did the scan find anything?", "what's going on with scanning lately?", or right after you yourself just queued a scan with request_scan.py and want to check on it a bit later in the conversation. Each event has a "time" and an "event" type: scan_requested/scan_completed/scan_failed (a full scan run, with "details" on completion/failure), pattern_new/pattern_changed (a specific pattern slot's contents, with "interface_label"/"pattern_index"/"inputs"/"outputs"), unknown_machine (a not-yet-labeled interface was found, with the same fields plus "interface_address" -- use that address with label_machine.py if the player answers), importer_pending_sort (a pattern is waiting on the wildcard importer for a "which machine" answer, with "sort_id"), and recipe_learned (a recipe was actually saved, with "machine").
-- This is a recent-activity feed (capped at the last 200 events), not the permanent record -- for a specific machine's full recipe list, use machine_recipes.py instead; for "did we ever learn X item," use get_recipe.py. Use recent_scans.py for "what's been happening lately" style questions, not as a general recipe lookup."""
+- This is a recent-activity feed (capped at the last 200 events), not the permanent record -- for a specific machine's full recipe list, use machine_recipes.py instead; for "did we ever learn X item," use get_recipe.py. Use recent_scans.py for "what's been happening lately" style questions, not as a general recipe lookup.
+
+About status.py -- dashboard numbers, and diagnosing "my new machine didn't show up":
+- Call this for any "how many machines/recipes are there," "what's the status of things," or general health-check style question -- it returns total known machines (with names), total recipes (split crafting-table vs GT machine), interface/queue backlog sizes, and the last scan's outcome, all in one call.
+- CRITICALLY, use the "scanner_visibility" section whenever a player says a new machine or interface isn't showing up after a scan -- do NOT guess about cables, power, or channels as the first move. Check "seen_but_never_had_a_pattern_reported" first: if the interface_address the player means IS in that list, the scanner genuinely CAN see it -- the interface is connected and the network path works, it just has no pattern encoded into any of its slots yet, so tell the player exactly that (encode/place a pattern in the interface, then ask for another scan) rather than asking them to check wiring. If an interface_address is NOT anywhere in "scanner_visibility" at all (not in known_machine_names, not in seen_but_never_had_a_pattern_reported), THEN it's a real connectivity question worth asking about -- the scanner has never seen it at all, at any point, occupied or not."""
 
 # ── call claude -p ────────────────────────────────────────────
 def ask_claude(messages, system=None):
@@ -1107,7 +1157,7 @@ def ask_claude(messages, system=None):
     parts.append("[Assistant]\n(reply below)")
     prompt = "\n\n".join(parts)
 
-    # Scoped to exactly these 13 scripts -- Claude cannot run arbitrary Bash
+    # Scoped to exactly these 14 scripts -- Claude cannot run arbitrary Bash
     # commands, only these specific invocations. Both "python3" and
     # "python" prefixes are allowlisted, but CRAFT_TOOLS_SYSTEM above tells
     # Claude to always use "python": on this Windows deployment "python3"
@@ -1116,7 +1166,7 @@ def ask_claude(messages, system=None):
     # see anthropics/claude-code#57946. Keeping the "python3" allowlist
     # entries around is harmless (they're just never used in practice) in
     # case a future machine's PATH ordering differs.
-    craft_tool_scripts = ["resolve_item.py", "get_recipe.py", "machine_recipes.py", "craft_plan.py", "request_craft.py", "label_machine.py", "request_scan.py", "unlabel_machine.py", "remove_recipe.py", "mark_importer.py", "sort_pattern.py", "describe_machine.py", "recent_scans.py"]
+    craft_tool_scripts = ["resolve_item.py", "get_recipe.py", "machine_recipes.py", "craft_plan.py", "request_craft.py", "label_machine.py", "request_scan.py", "unlabel_machine.py", "remove_recipe.py", "mark_importer.py", "sort_pattern.py", "describe_machine.py", "recent_scans.py", "status.py"]
     allowed_tools = []
     for script in craft_tool_scripts:
         allowed_tools.append(f"Bash(python3 tools/{script}:*)")
@@ -2112,6 +2162,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             recent.reverse()
             self.send_json(200, {"count": len(recent), "events": recent})
 
+        elif self.path.startswith("/status"):
+            self.handle_status()
+
         else:
             self.send_json(404, {"error": "not found"})
 
@@ -2155,6 +2208,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         if self.path == "/report_pattern":
             self.handle_report_pattern()
+            return
+
+        if self.path == "/report_interface_seen":
+            self.handle_report_interface_seen()
             return
 
         if self.path == "/report_labels":
@@ -2560,6 +2617,40 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                    interface_label=label, inputs=in_desc, outputs=out_desc)
 
         self.send_json(200, {"status": "ok", "new": is_new, "changed": is_changed})
+
+    def handle_report_interface_seen(self):
+        """Called by scan_patterns_oc.lua's scanInterface() unconditionally,
+        every scan, for every interface it looks at -- occupied or not. See
+        seen_interfaces.json's comment above for why this exists as a
+        separate, pure-bookkeeping record (no chat prompt, no
+        machine-identity logic -- just "the scanner can currently see this
+        address")."""
+        data, err = self._read_json_body()
+        if err:
+            self.send_json(400, {"error": err})
+            return
+
+        addr = data.get("interface_address")
+        if not addr:
+            self.send_json(400, {"error": "missing interface_address"})
+            return
+
+        with seen_interfaces_lock:
+            seen_interfaces[addr] = {
+                "interface_address": addr,
+                "interface_label": data.get("interface_label") or addr[:8],
+                "occupied": bool(data.get("occupied", False)),
+                "pattern_count": int(data.get("pattern_count", 0) or 0),
+                "last_seen": time.strftime("%Y-%m-%d %H:%M:%S"),
+            }
+            try:
+                save_seen_interfaces()
+            except Exception as e:
+                print(f"[seen-interfaces][err] failed to save seen_interfaces.json: {e}")
+                self.send_json(500, {"error": str(e)})
+                return
+
+        self.send_json(200, {"status": "ok"})
 
     # ── machine labeling endpoint ─────────────────────────────────
     def handle_label_machine(self):
@@ -3174,6 +3265,119 @@ class Handler(http.server.BaseHTTPRequestHandler):
         record_scan_event("scan_completed" if success else "scan_failed", scan_id=scan_id, details=details)
         self.send_json(200, {"status": "ok"})
 
+    def handle_status(self):
+        """GET /status -- Claude (via tools/status.py), or a person checking
+        the web viewer -- aggregate dashboard numbers (total machines,
+        total recipes, queue/backlog sizes, scanner visibility) so
+        questions like "how many machines are there" or "is my new
+        interface even visible to the scanner" can be answered directly
+        instead of pieced together from several other tool calls or
+        guessed at. Read-only: acquires each store's lock briefly and
+        separately to snapshot it, never two at once (this file's
+        established convention -- see get_known_machine_names()'s comment
+        for the same rule), so this can't deadlock against any other
+        handler no matter what order requests arrive in.
+
+        The "scanner_visibility" section directly targets the confusion
+        from 2026-07-24: a real, connected, powered-on interface with no
+        pattern encoded in it yet used to be completely invisible
+        server-side (see seen_interfaces.json's comment above) -- this
+        surfaces exactly those addresses instead of leaving them
+        indistinguishable from "not wired up at all"."""
+        with recipe_db_lock:
+            total_items = len(recipe_db)
+            total_recipes = 0
+            gt_machine_recipes = 0
+            for recipes in recipe_db.values():
+                total_recipes += len(recipes)
+                gt_machine_recipes += sum(1 for r in recipes if r.get("type") == "gt_machine")
+        crafting_recipes = total_recipes - gt_machine_recipes
+
+        known_machines = get_known_machine_names()  # own locking (interface_meta then recipe_db, sequential, non-nested)
+
+        with interface_meta_lock:
+            labeled = sum(1 for e in interface_meta.values() if e.get("machine") and e.get("machine") != WILDCARD_MACHINE)
+            importer_interfaces = sum(1 for e in interface_meta.values() if e.get("machine") == WILDCARD_MACHINE)
+            awaiting_label = sum(1 for e in interface_meta.values() if not e.get("machine"))
+            known_addrs = set(interface_meta.keys())
+
+        with seen_interfaces_lock:
+            seen_snapshot = dict(seen_interfaces)
+
+        # Interfaces the scanner can currently see but that have NEVER had
+        # an occupied pattern reported (i.e. never made it into
+        # interface_meta at all) -- these are real, connected, visible
+        # interfaces with nothing encoded in them yet, not a wiring
+        # problem. If an address the player expects isn't even in THIS
+        # list, that's the real sign of an actual connectivity issue.
+        seen_but_never_reported = [
+            {
+                "interface_address": addr,
+                "interface_label": e.get("interface_label"),
+                "last_seen": e.get("last_seen"),
+            }
+            for addr, e in seen_snapshot.items()
+            if addr not in known_addrs
+        ]
+
+        with known_patterns_lock:
+            total_known_pattern_slots = len(known_patterns)
+
+        with pending_scans_lock:
+            scan_counts = {}
+            for s in pending_scans.values():
+                st = s.get("status", "?")
+                scan_counts[st] = scan_counts.get(st, 0) + 1
+
+        with pending_jobs_lock:
+            job_counts = {}
+            for j in pending_jobs.values():
+                st = j.get("status", "?")
+                job_counts[st] = job_counts.get(st, 0) + 1
+
+        with pending_sorts_lock:
+            awaiting_sort = len(pending_sorts)
+
+        with machine_notes_lock:
+            machines_with_description = len(machine_notes)
+
+        with scan_events_lock:
+            last_scan = None
+            for e in reversed(scan_events):
+                if e.get("event") in ("scan_completed", "scan_failed"):
+                    last_scan = e
+                    break
+
+        self.send_json(200, {
+            "recipes": {
+                "total_items_indexed": total_items,
+                "total_recipes": total_recipes,
+                "crafting_table_recipes": crafting_recipes,
+                "gt_machine_recipes": gt_machine_recipes,
+            },
+            "machines": {
+                "total_known_machines": len(known_machines),
+                "known_machine_names": known_machines,
+                "labeled_interfaces": labeled,
+                "importer_interfaces": importer_interfaces,
+                "interfaces_awaiting_label": awaiting_label,
+                "machines_with_description": machines_with_description,
+            },
+            "scanner_visibility": {
+                "total_interfaces_seen_by_scanner": len(seen_snapshot),
+                "seen_but_never_had_a_pattern_reported": seen_but_never_reported,
+            },
+            "patterns": {
+                "total_known_pattern_slots": total_known_pattern_slots,
+            },
+            "queues": {
+                "scan_requests_by_status": scan_counts,
+                "craft_jobs_by_status": job_counts,
+                "importer_sorts_awaiting_answer": awaiting_sort,
+            },
+            "last_scan": last_scan,
+        })
+
 # ── main ──────────────────────────────────────────────────────
 if __name__ == "__main__":
     if not check_claude():
@@ -3188,6 +3392,7 @@ if __name__ == "__main__":
     load_pending_scans()
     load_scan_events()
     load_interface_meta()
+    load_seen_interfaces()
     load_pending_sorts()
     load_machine_notes()
 
