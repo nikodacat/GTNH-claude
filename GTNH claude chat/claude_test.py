@@ -29,6 +29,8 @@
 #    POST /remove_recipe        -- Claude (via tools/remove_recipe.py) deletes a specific bad/mislearned recipe
 #    POST /mark_importer        -- Claude (via tools/mark_importer.py) marks an interface as the shared wildcard importer
 #    POST /sort_pattern         -- Claude (via tools/sort_pattern.py) resolves a pending importer sort into a learned recipe
+#    POST /describe_machine     -- Claude (via tools/describe_machine.py) writes/updates a machine's free-text description
+#    GET  /machine_recipes      -- Claude (via tools/machine_recipes.py) lists a machine's known recipes + its description
 # =============================================
 
 import http.server
@@ -553,6 +555,40 @@ def save_interface_meta():
     os.replace(tmp_path, INTERFACE_META_PATH)
 
 
+# ── free-text machine descriptions (machine_notes.json) ────────────────
+# A short human- or Claude-written note per machine name -- "makes GT
+# circuit boards, tier LV-MV, uses the copper+redstone recipe", "this is
+# the one near spawn, output feeds the assembly line" -- so future chat
+# doesn't have to re-derive context from scratch every time a machine
+# comes up, and Claude can proactively be specific instead of generic.
+# Deliberately separate from interface_meta/recipe_db: a description is a
+# property of the MACHINE NAME (same one both dedicated-interface and
+# wildcard-importer-routed patterns share), not of any one interface or
+# recipe. Keyed by the canonical name from get_known_machine_names() --
+# handle_describe_machine enforces that the same way handle_sort_pattern
+# enforces it for recipes, so a description can't fork under a typo'd
+# variant of a name that already has one.
+MACHINE_NOTES_PATH = "machine_notes.json"
+machine_notes = {}   # machine_name -> {"description": str, "updated_at": str}
+machine_notes_lock = threading.Lock()
+
+def load_machine_notes():
+    global machine_notes
+    if not os.path.exists(MACHINE_NOTES_PATH):
+        print(f"[~] {MACHINE_NOTES_PATH} not found -- starting with no machine notes.")
+        return
+    with open(MACHINE_NOTES_PATH, "r", encoding="utf-8") as f:
+        machine_notes = json.load(f)
+    print(f"[~] Loaded machine_notes.json: {len(machine_notes):,} machine note(s) on record.")
+
+def save_machine_notes():
+    """Write machine_notes back to disk. Caller must hold machine_notes_lock."""
+    tmp_path = MACHINE_NOTES_PATH + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(machine_notes, f, ensure_ascii=False, indent=2)
+    os.replace(tmp_path, MACHINE_NOTES_PATH)
+
+
 # ── wildcard-importer pending sorts (pending_sorts.json) ───────────────
 # A single physical me_interface can be marked (see handle_mark_importer,
 # tools/mark_importer.py) as a shared staging spot: the player drops ANY
@@ -959,9 +995,10 @@ def check_claude():
 # their own context. See tools/*.py for the actual scripts -- each is a
 # thin wrapper around an existing server endpoint, so there's exactly
 # one implementation of each lookup no matter who calls it.
-CRAFT_TOOLS_SYSTEM = """You have access to ten command-line tools (run them with your Bash tool, exactly as shown -- nothing else is permitted):
+CRAFT_TOOLS_SYSTEM = """You have access to twelve command-line tools (run them with your Bash tool, exactly as shown -- nothing else is permitted):
   python tools/resolve_item.py <name>              -- resolve an item name/label (English or otherwise -- translate it yourself first if needed) to candidate item ids
   python tools/get_recipe.py <item_id>              -- look up recipe_db.json recipes for an exact item id
+  python tools/machine_recipes.py <machine name> [limit] -- list all recipes learned for a specific machine (e.g. "Assembly Line"); limit defaults to 100
   python tools/craft_plan.py <item_id> [qty]        -- get the static craft-tree plan for item+qty
   python tools/request_craft.py <item_id> <qty>     -- QUEUE a craft request (does NOT execute it -- see below)
   python tools/label_machine.py <interface_address> <machine name> -- label a not-yet-identified machine (see below)
@@ -970,6 +1007,7 @@ CRAFT_TOOLS_SYSTEM = """You have access to ten command-line tools (run them with
   python tools/remove_recipe.py <machine name> [item_id] -- delete a specific bad/mislearned recipe, or all recipes for that machine if item_id is omitted (see below)
   python tools/mark_importer.py <interface_address> -- mark an interface as the shared wildcard importer (see below)
   python tools/sort_pattern.py <sort_id> <machine name> -- resolve a pending importer sort prompt (see below)
+  python tools/describe_machine.py "<machine name>" "<description>" -- write/update a machine's free-text description (see below; BOTH args must be quoted)
 
 IMPORTANT: always run these with `python`, never `python3`. On this machine, `python3` resolves to a broken Windows Store redirect stub that silently exits with no output whenever it's run non-interactively -- it will look like the tool did nothing, with no error to explain why. `python` is the one that actually works.
 
@@ -997,7 +1035,12 @@ About mark_importer.py and sort_pattern.py -- the shared "wildcard" interface:
 - Once marked, every new or changed pattern placed on that interface produces its own chat message: "New pattern on the importer interface ...: in: X -> out: Y. Which machine is this for? (sort_id: <id>)" -- this is DIFFERENT from the normal "Found an unidentified machine" prompt (that one is asked once per interface; this one is asked once per PATTERN, since many different patterns pass through the same importer over time).
 - When the player answers, call sort_pattern.py with that exact sort_id and the machine name they gave. If the response is {"status": "ok", ...}, it matched an existing machine and is learned -- nothing more to do. If instead it's {"status": "unknown_machine", "did_you_mean": ..., "known_machines": [...]}, it did NOT learn anything (and the sort_id is still usable) -- this always means the name didn't match anything on record, never that it created something new. If did_you_mean looks right, confirm with the player, then call sort_pattern.py again with that sort_id and the EXACT suggested name -- it'll match and learn. If did_you_mean is wrong or null, tell the player none of the known machines matched and show them known_machines so they can give you the exact right name, then call again with that. Never invent a new machine name here or tell the player one was created -- if a pattern genuinely belongs to a machine that has no name yet, that machine needs its own dedicated interface labeled with label_machine.py first, not the importer.
 - If the player answers in Chinese (or anything other than English) -- expected, some players use a Chinese client -- translate their answer to the machine's standard English/GTNH name yourself before calling sort_pattern.py. The server only does literal string-similarity matching (via difflib), it has no translation ability of its own -- if you pass it untranslated Chinese, it will never find a match against the English names already on record even when the machine genuinely already exists, and will wrongly report unknown_machine every time. Translating is your job, not the server's.
-- Never guess or reuse a sort_id from a different prompt -- each one is tied to one specific pattern occurrence and can only be answered once it's actually learned (an unknown_machine response does NOT consume it -- the same sort_id stays usable for a corrected retry)."""
+- Never guess or reuse a sort_id from a different prompt -- each one is tied to one specific pattern occurrence and can only be answered once it's actually learned (an unknown_machine response does NOT consume it -- the same sort_id stays usable for a corrected retry).
+
+About describe_machine.py and machine_recipes.py -- giving machines real context:
+- Any machine can have a short free-text description attached, written by either you or the player, so future conversations about it are fluent instead of generic. Good moments to write or update one: right after learning a machine's first recipe (summarize what it makes and roughly what it needs, e.g. "Circuit Assembler: makes basic circuit boards from copper + redstone, LV-MV tier"), or whenever the player tells you something worth remembering about a specific machine (its location, its role in their base, a quirk, etc.). Don't ask permission first for the routine "just learned a recipe" case -- just write a short, factual note and mention in passing that you did; DO check with the player before overwriting an existing description with something substantially different, since it might have been written for a reason you don't know.
+- Call describe_machine.py with the machine name and the description, BOTH quoted as separate arguments (e.g. describe_machine.py "Circuit Assembler" "Makes circuit boards from copper + redstone, LV-MV tier"). Same known-machine matching as sort_pattern.py -- an unrecognized name comes back as {"status": "unknown_machine", "did_you_mean": ..., "known_machines": [...]} and saves nothing; use the corrected/suggested name and call again. Overwrites any existing description outright -- there's no history, so don't call this for a machine whose note you haven't actually reviewed first if you're not sure what's already there.
+- Call machine_recipes.py <machine name> whenever a player asks something like "what does my Assembler do again?", "what can X machine make?", or references a machine by name generally rather than asking about one specific item -- it returns BOTH the stored description AND every recipe learned for that machine in one call, so you don't need get_recipe.py's single-item lookup for this kind of broader question. If description is null, nothing's been written yet -- consider writing one from the returned recipes if there are any, or just say no notes exist yet."""
 
 # ── call claude -p ────────────────────────────────────────────
 def ask_claude(messages, system=None):
@@ -1010,7 +1053,7 @@ def ask_claude(messages, system=None):
     parts.append("[Assistant]\n(reply below)")
     prompt = "\n\n".join(parts)
 
-    # Scoped to exactly these 10 scripts -- Claude cannot run arbitrary Bash
+    # Scoped to exactly these 12 scripts -- Claude cannot run arbitrary Bash
     # commands, only these specific invocations. Both "python3" and
     # "python" prefixes are allowlisted, but CRAFT_TOOLS_SYSTEM above tells
     # Claude to always use "python": on this Windows deployment "python3"
@@ -1019,7 +1062,7 @@ def ask_claude(messages, system=None):
     # see anthropics/claude-code#57946. Keeping the "python3" allowlist
     # entries around is harmless (they're just never used in practice) in
     # case a future machine's PATH ordering differs.
-    craft_tool_scripts = ["resolve_item.py", "get_recipe.py", "craft_plan.py", "request_craft.py", "label_machine.py", "request_scan.py", "unlabel_machine.py", "remove_recipe.py", "mark_importer.py", "sort_pattern.py"]
+    craft_tool_scripts = ["resolve_item.py", "get_recipe.py", "machine_recipes.py", "craft_plan.py", "request_craft.py", "label_machine.py", "request_scan.py", "unlabel_machine.py", "remove_recipe.py", "mark_importer.py", "sort_pattern.py", "describe_machine.py"]
     allowed_tools = []
     for script in craft_tool_scripts:
         allowed_tools.append(f"Bash(python3 tools/{script}:*)")
@@ -1810,6 +1853,58 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     "recipes": recipes,
                 })
 
+        elif self.path.startswith("/machine_recipes"):
+            # /machine_recipes?machine=Assembly+Line&limit=100
+            # Also returns this machine's stored description (see
+            # machine_notes.json / tools/describe_machine.py) alongside
+            # its recipes, in one call -- the point being that a player
+            # asking "what's my Assembler good for?" only needs Claude to
+            # make ONE lookup to get both the free-text note and the
+            # concrete recipe list, not two separate tool calls.
+            machine = None
+            limit = 100
+            if "machine=" in self.path:
+                machine = self.path.split("machine=")[1].split("&")[0]
+                machine = machine.replace("%3A", ":").replace("+", " ")
+            if "limit=" in self.path:
+                try: limit = max(1, int(self.path.split("limit=")[1].split("&")[0]))
+                except: limit = 100
+            if not machine:
+                self.send_json(400, {"error": "missing ?machine= parameter"})
+            elif not recipe_db:
+                self.send_json(503, {"error": "recipe DB not loaded"})
+            else:
+                # resolve to the canonical known-machine casing first (if
+                # any) so "circuit assembler" still finds "Circuit
+                # Assembler"'s recipes/description instead of matching
+                # nothing over a case difference.
+                known = get_known_machine_names()
+                exact = next((m for m in known if m.lower() == machine.lower()), None)
+                lookup_name = exact if exact is not None else machine
+
+                items = []
+                with recipe_db_lock:
+                    for item_id, recipes in recipe_db.items():
+                        for r in recipes:
+                            if (isinstance(r, dict) and r.get("type") == "gt_machine"
+                                    and r.get("machine") == lookup_name):
+                                items.append({"item": item_id, "recipe": r})
+                                if len(items) >= limit:
+                                    break
+                        if len(items) >= limit:
+                            break
+
+                with machine_notes_lock:
+                    note = machine_notes.get(lookup_name)
+
+                self.send_json(200, {
+                    "machine"    : lookup_name,
+                    "found"      : len(items) > 0,
+                    "count"      : len(items),
+                    "items"      : items,
+                    "description": note.get("description") if note else None,
+                })
+
         elif self.path.startswith("/search"):
             # /search?q=iron_ingot&limit=10
             query = ""
@@ -2030,6 +2125,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         if self.path == "/sort_pattern":
             self.handle_sort_pattern()
+            return
+
+        if self.path == "/describe_machine":
+            self.handle_describe_machine()
             return
 
         if self.path != "/chat":
@@ -2698,6 +2797,54 @@ class Handler(http.server.BaseHTTPRequestHandler):
         append_log("claude", msg)
         self.send_json(200, {"status": "ok", "sort_id": sort_id, "machine": machine, "learned_item": learned_item})
 
+    # ── attach/update a machine's free-text description ─────────────
+    def handle_describe_machine(self):
+        """Called by tools/describe_machine.py -- either the player or
+        Claude itself can write this (e.g. Claude summarizing what a
+        machine does after learning a few recipes for it, or the player
+        giving context like "that one's near spawn, feeds the assembly
+        line"). Same known-machine enforcement as /sort_pattern and for
+        the same reason: a description has to land on the canonical name
+        or it'll never be found again under a typo'd variant. Overwrites
+        any existing description outright (no history kept) -- this is a
+        living note, not a log."""
+        data, err = self._read_json_body()
+        if err:
+            self.send_json(400, {"error": err})
+            return
+
+        machine = data.get("machine")
+        description = data.get("description")
+        if not machine or not description:
+            self.send_json(400, {"error": "missing machine or description"})
+            return
+
+        known = get_known_machine_names()
+        exact = next((m for m in known if m.lower() == machine.lower()), None)
+        if exact is None:
+            close = difflib.get_close_matches(machine, known, n=3, cutoff=0.5)
+            self.send_json(200, {"status": "unknown_machine", "you_said": machine,
+                                  "did_you_mean": close[0] if close else None,
+                                  "suggestions": close, "known_machines": known})
+            return
+
+        with machine_notes_lock:
+            machine_notes[exact] = {
+                "description": description,
+                "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            }
+            try:
+                save_machine_notes()
+            except Exception as e:
+                print(f"[machine-notes][err] failed to save machine_notes.json: {e}")
+                append_log("error", f"failed to save machine_notes.json: {e}")
+                self.send_json(500, {"error": str(e)})
+                return
+
+        print(f"[machine-notes] {exact}: {description}")
+        append_log("claude", f"Noted for {exact}: {description}")
+        self.send_json(200, {"status": "ok", "machine": exact, "description": description})
+
     # ── item label scan endpoint ─────────────────────────────────
     def handle_report_labels(self):
         """Receives a batch of {id, damage, label} entries from a manually-
@@ -2960,6 +3107,7 @@ if __name__ == "__main__":
     load_pending_scans()
     load_interface_meta()
     load_pending_sorts()
+    load_machine_notes()
 
     # ThreadingHTTPServer, not plain HTTPServer: handle_upload_recipe_image()
     # blocks on a `claude -p` subprocess for up to 120s (vision extraction is
