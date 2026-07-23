@@ -377,12 +377,14 @@ local function scanInterface(addr)
   end
 
   local foundAny = false
+  local occupiedCount = 0
   -- see INDEXING CAVEAT: 0..9 is a superset of both a 0-based 0-8
   -- range and a 1-based 1-9 range (9 pattern slots per interface).
   for patternIndex = 0, 9 do
     local ok2, pattern = pcall(proxy.getInterfacePattern, patternIndex)
     if ok2 and pattern then
       foundAny = true
+      occupiedCount = occupiedCount + 1
       local rawInputs  = pattern.inputs  or {}
       local rawOutputs = pattern.outputs or {}
       dbg(string.format("  interface %s pattern[%d]: %d input slot(s), %d output slot(s)",
@@ -477,6 +479,24 @@ local function scanInterface(addr)
   end
   if not foundAny then
     dbg("  interface "..label..": no occupied pattern slots found")
+  end
+
+  -- Report presence unconditionally (occupied or not) -- see the
+  -- 2026-07-24 bug note above getInterfaceList(): the pattern-report
+  -- pipeline (POST /report_pattern) only ever tells the server about an
+  -- interface once it has an actual encoded pattern, so a real,
+  -- connected, powered interface with nothing encoded in it yet was
+  -- completely invisible server-side -- indistinguishable from "not
+  -- wired up at all," which led to guessing about cables/power/channels
+  -- when the real answer was just "no pattern placed yet." This is
+  -- silent bookkeeping only -- no chat prompt, no machine-identity
+  -- logic -- just presence + occupied-pattern-count so a status/
+  -- dashboard tool call can tell the two situations apart.
+  local seenBody = string.format('{"interface_address":%s,"interface_label":%s,"occupied":%s,"pattern_count":%d}',
+    jsonStr(addr), jsonStr(label), foundAny and "true" or "false", occupiedCount)
+  local seenResp, seenErr = postJson("/report_interface_seen", seenBody)
+  if not seenResp then
+    dbg("  [WARN] report_interface_seen failed for "..label..": "..tostring(seenErr))
   end
 end
 
