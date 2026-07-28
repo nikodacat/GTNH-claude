@@ -35,7 +35,15 @@ local function loadConfig()
   return cfg
 end
 
-local SERVER = loadConfig().SERVER
+local cfg = loadConfig()
+local SERVER = cfg.SERVER
+-- optional (2026-07-24, auto-pattern-write feature) -- address of a spare
+-- ME Interface to write newly-discovered CRAFTING-TABLE patterns onto; nil
+-- if not configured, in which case that one path just no-ops (see
+-- tryAutoWritePattern() below). gt_machine patterns don't need this --
+-- they target their own machine's real interface, looked up via the
+-- server's /machine_interface endpoint instead.
+local AUTO_CRAFT_SCRATCH_INTERFACE = cfg.AUTO_CRAFT_SCRATCH_INTERFACE
 local SCRIPT_NAME = "craft_oc"
 
 -- ── crash-resistant local log file ─────────────
@@ -166,8 +174,15 @@ dbg("Hardware checks passed")
 dbg("Binding components...")
 local net = component.internet
 local me  = component.me_controller
+-- optional (2026-07-24, auto-pattern-write feature) -- a Database Upgrade
+-- is only needed to stage item identities for setInterfacePatternInput/
+-- Output writes; not required for this script's core craft-job loop, so
+-- its absence just disables tryAutoWritePattern() (checked there), not a
+-- hard stop here.
+local db = component.isAvailable("database") and component.database or nil
 dbg("net proxy: " .. tostring(net))
 dbg("me proxy : " .. tostring(me))
+dbg("db proxy : " .. tostring(db) .. (db and "" or " (auto-pattern-write disabled -- no Database Upgrade connected)"))
 
 -- ── colour helpers ────────────────────────────
 local gpu = hasGPU and component.gpu or nil
@@ -314,6 +329,335 @@ local function getCraftables()
   return list
 end
 
+-- ── auto-pattern-write (2026-07-24) ───────────
+-- When a queued craft job has no matching AE2 craftable pattern,
+-- tryAutoWritePattern() below is called BEFORE giving up: it asks the
+-- server for a normalized write plan (GET /pattern_write_plan, see that
+-- endpoint's own comment in claude_test.py for why the plan is pre-
+-- normalized server-side rather than parsed from raw recipe_db.json here),
+-- then writes the pattern directly via me_interface.setInterfacePattern-
+-- Input/Output -- the same direct-write API confirmed working in-game by
+-- the user on 2026-07-22 (see test_pattern_write_direct_oc.lua, this
+-- project's proof-of-concept for the crafting-table case). This is the
+-- FIRST time that logic has been wired into the live production craft
+-- loop rather than a standalone test script.
+--
+-- Two target surfaces, chosen by the recipe's type:
+--   crafting_shaped/crafting_shapeless -> a configured spare scratch
+--     interface (AUTO_CRAFT_SCRATCH_INTERFACE in config.lua) -- these
+--     recipes have no machine of their own to target.
+--   gt_machine -> that machine's OWN dedicated interface, looked up via
+--     GET /machine_interface. UNPROVEN PATH: writing a processing pattern
+--     (as opposed to a crafting pattern) via this direct API has never
+--     been empirically confirmed in this project's history -- only the
+--     crafting-table case has real in-game proof. Treat any success here
+--     with the same suspicion the getCraftables() check below is designed
+--     to catch: a write call returning true has repeatedly, historically,
+--     NOT meant AE2 actually accepted the result as a real pattern.
+--
+-- Also: fluid-requiring gt_machine recipes are cleanly refused (fluid
+-- inputs/outputs are not supported by this direct-write API as currently
+-- understood -- see file header of test_pattern_write_direct_oc.lua and
+-- claude_test.py's /pattern_write_plan comment) rather than attempting a
+-- partial, wrong, item-only pattern.
+
+-- ── split "modid:name:meta" or "modid:name" into id,damage ──
+local function splitItemId(s)
+  local parts={}
+  for p in s:gmatch("[^:]+") do parts[#parts+1]=p end
+  if #parts>=3 then
+    return parts[1]..":"..parts[2], tonumber(parts[3]) or 0
+  elseif #parts==2 then
+    return parts[1]..":"..parts[2], 0
+  end
+  return s, 0
+end
+
+-- ── tiny JSON array-of-strings extractor (ported from
+-- test_pattern_write_direct_oc.lua -- still needed here for /oredict's
+-- plain-string "entries" array; the NEW /pattern_write_plan "inputs" array
+-- of OBJECTS uses parseInputsArray() below instead, since this one can't
+-- handle nested objects) ──
+local function extractArr(raw, key)
+  local s = raw:match('"'..key..'":%s*(%[.-%])')
+  if not s then return nil end
+  local out={}
+  for entry in s:gmatch('([^,%[%]]+)') do
+    entry=entry:match("^%s*(.-)%s*$")
+    if entry=="null" then out[#out+1]=false
+    elseif entry:sub(1,1)=='"' then out[#out+1]=entry:match('"([^"]*)"') end
+  end
+  return out
+end
+
+-- ── resolve an ore:xxx tag to a concrete item via the authoritative
+-- ore_dict.json table on the server (see test_pattern_write_direct_oc.lua's
+-- own comment for the full reasoning -- ported verbatim, proven logic) ──
+local function resolveOreTag(tag)
+  local encoded = tag:gsub(":", "%%3A")
+  -- not quiet: auto-write only runs on a genuine job failure (rare), and
+  -- this is a brand-new, unproven feature -- the extra HTTP trace is worth
+  -- having in the log for debugging, unlike the 10s job-poll loop below.
+  local raw, err = get("/oredict?tag="..encoded)
+  if not raw then return nil, "oredict lookup failed: "..tostring(err) end
+  if not raw:find('"found":%s*true') then
+    return nil, "no oredict entries for "..tag.." (tag not in ore_dict.json)"
+  end
+
+  local entries = extractArr(raw, "entries")
+  if not entries or #entries == 0 then
+    return nil, "oredict lookup returned no entries for "..tag
+  end
+
+  local ok, items = pcall(me.getItemsInNetwork, {})
+  local stockByKey = {}
+  if ok and items then
+    for _, it in ipairs(items) do
+      stockByKey[(it.name or "")..":"..tostring(it.damage or 0)] = it
+    end
+  end
+
+  local bestId, bestDmg, bestStock, bestSize = nil, nil, nil, -1
+  for _, e in ipairs(entries) do
+    local id, dmg = splitItemId(e)
+    local stocked = stockByKey[id..":"..tostring(dmg)]
+    local size = stocked and (stocked.size or 0) or 0
+    if size > bestSize then
+      bestId, bestDmg, bestStock, bestSize = id, dmg, stocked, size
+    end
+  end
+
+  if not bestId then return nil, "no candidates resolved for "..tag end
+  dbg(string.format("  [NOTE] resolved %s -> %s:%d (%s)",
+    tag, bestId, bestDmg, bestSize > 0 and ("you have "..bestSize) or "none in stock -- using first candidate"))
+  return bestId, bestDmg
+end
+
+local function resolveEntry(entry)
+  if entry:sub(1,4)=="ore:" then
+    return resolveOreTag(entry)
+  else
+    return splitItemId(entry)
+  end
+end
+
+-- ── parse /pattern_write_plan's "inputs" array of {"index","entry","count"}
+-- objects. Uses Lua's %b{} balanced-brace pattern to pull out each object
+-- (safe here because the server always emits this array flat, no nested
+-- braces inside an entry -- see claude_test.py's /pattern_write_plan
+-- comment on why it emits this fixed, uniform shape specifically so this
+-- side doesn't need a real JSON parser). Tolerant of json.dumps' default
+-- ", "/": " spacing via %s* between fields. ──
+local function parseInputsArray(raw)
+  local arrStr = raw:match('"inputs"%s*:%s*(%[.-%])')
+  if not arrStr then return {} end
+  local out = {}
+  for obj in arrStr:gmatch('%b{}') do
+    local idx   = obj:match('"index"%s*:%s*(%d+)')
+    local entry = obj:match('"entry"%s*:%s*"(.-)"')
+    local cnt   = obj:match('"count"%s*:%s*(%d+)')
+    if idx and entry then
+      out[#out+1] = {index=tonumber(idx), entry=entry, count=tonumber(cnt) or 1}
+    end
+  end
+  return out
+end
+
+-- ── fetch + parse a normalized write plan for one item. Returns
+-- (plan, nil) on success, (nil, reason) otherwise -- `reason` is always a
+-- human-readable string suitable for a chat failure message. ──
+local function fetchWritePlan(item)
+  local encoded = item:gsub(":", "%%3A")
+  -- not quiet -- see resolveOreTag's comment on why this feature's rare
+  -- HTTP calls are worth tracing, unlike the 10s job-poll loop below.
+  local raw, err = get("/pattern_write_plan?item="..encoded)
+  if not raw then return nil, "pattern_write_plan request failed: "..tostring(err) end
+  if not raw:find('"found"%s*:%s*true') then
+    return nil, extractStr(raw, "reason") or "no write plan available"
+  end
+  local inputs = parseInputsArray(raw)
+  if #inputs == 0 then
+    return nil, "write plan has no resolvable inputs"
+  end
+  return {
+    rtype        = extractStr(raw, "rtype"),
+    machine      = extractStr(raw, "machine"),
+    outputEntry  = extractStr(raw, "output_entry") or item,
+    outputCount  = extractNum(raw, "output_count") or 1,
+    requiresFluid= raw:find('"requires_fluid"%s*:%s*true') ~= nil,
+    inputs       = inputs,
+  }, nil
+end
+
+-- ── clear whatever's in a pattern slot before rewriting (tolerant of
+-- errors either way, same as test_pattern_write_direct_oc.lua -- no
+-- "priming" needed for this direct-write API) ──
+local function clearPattern(meiProxy, patternIndex, maxIn, maxOut)
+  for i=1,maxIn do
+    pcall(meiProxy.clearInterfacePatternInput, patternIndex, i)
+  end
+  for o=1,maxOut do
+    pcall(meiProxy.clearInterfacePatternOutput, patternIndex, o)
+  end
+end
+
+-- ── sweep a me_interface's pattern slots for an empty one, so auto-write
+-- never clobbers an existing real pattern. Confirmed range: 9 pattern
+-- slots per interface, 1-indexed for writes (see PATTERN_INDEX comment in
+-- test_pattern_write_direct_oc.lua, confirmed live 2026-07-22) -- swept as
+-- 1..9 here specifically (NOT scan_patterns_oc.lua's wider 0..9 READ probe
+-- range, which exists there only because that script wasn't sure of the
+-- base and 0..9 safely supersets both possibilities for a read; writing to
+-- an unconfirmed index 0 is not worth the risk here). A slot is "empty" iff
+-- getInterfacePattern() succeeds and returns nil/false -- a slot whose read
+-- THREW is treated as unknown/unsafe and skipped, not empty. ──
+local function findEmptyPatternSlot(meiProxy)
+  for i=1,9 do
+    local ok, pattern = pcall(meiProxy.getInterfacePattern, i)
+    if ok and not pattern then
+      return i
+    end
+  end
+  return nil, "no empty pattern slot found (all 9 occupied, or every probe errored)"
+end
+
+-- ── write one plan into one pattern slot on one interface. Returns
+-- (true, outId, outDmg) on success (write calls all returned true --
+-- caller MUST still verify via getCraftables(), see tryAutoWritePattern),
+-- or (false, reason) if a resolve/write step failed outright. ──
+local function writePatternToInterface(meiProxy, patternIndex, plan)
+  clearPattern(meiProxy, patternIndex, 9, 4)
+
+  local dbSlot = 1
+  for _, input in ipairs(plan.inputs) do
+    local id, dmg = resolveEntry(input.entry)
+    if not id then
+      return false, "could not resolve ingredient '"..input.entry.."'"
+    end
+    local okSet = pcall(db.set, dbSlot, id, dmg)
+    if not okSet then
+      return false, "database.set failed (slot "..dbSlot..") for "..id
+    end
+    local okWrite, writeErr = pcall(meiProxy.setInterfacePatternInput,
+      patternIndex, db.address, dbSlot, input.count, input.index)
+    if not okWrite then
+      return false, "setInterfacePatternInput failed (db slot "..dbSlot..", grid index "..input.index.."): "..tostring(writeErr)
+    end
+    dbSlot = dbSlot + 1
+  end
+
+  local outId, outDmg = splitItemId(plan.outputEntry)
+  local okSetOut = pcall(db.set, dbSlot, outId, outDmg)
+  if not okSetOut then
+    return false, "database.set (output) failed (slot "..dbSlot..")"
+  end
+  local okWriteOut, writeOutErr = pcall(meiProxy.setInterfacePatternOutput,
+    patternIndex, db.address, dbSlot, plan.outputCount, 1)
+  if not okWriteOut then
+    return false, "setInterfacePatternOutput failed (slot "..dbSlot.."): "..tostring(writeOutErr)
+  end
+
+  return true, outId, outDmg
+end
+
+-- ── THE check that actually matters (see test_pattern_write_direct_oc.lua's
+-- extensive comment on why): does the output genuinely show up in
+-- me_controller.getCraftables()? A write call returning true has, all
+-- through this project's history, never been reliable proof by itself. ──
+local function verifyCraftable(outId, outDmg)
+  local ok, craftables = pcall(me.getCraftables)
+  if not ok or not craftables then return false end
+  for _, c in ipairs(craftables) do
+    local okStack, stack = pcall(c.getItemStack)
+    if okStack and stack and stack.name == outId and (stack.damage or 0) == outDmg then
+      return true
+    end
+  end
+  return false
+end
+
+-- ── top-level orchestrator, called from claimAndStartJobs() when no
+-- existing craftable pattern matches a queued job's item. Returns
+-- (true, nil) on a VERIFIED success (getCraftables() confirms it), or
+-- (false, reason) for every other outcome -- caller falls back to the
+-- normal "no pattern found" job failure either way, just with a more
+-- specific reason attached. ──
+local function tryAutoWritePattern(jobItem)
+  if not db then
+    return false, "no Database Upgrade connected -- auto-write disabled"
+  end
+
+  local plan, planErr = fetchWritePlan(jobItem)
+  if not plan then
+    return false, "no write plan: "..tostring(planErr)
+  end
+  if plan.requiresFluid then
+    return false, "recipe needs fluid input/output -- direct pattern write doesn't support fluids"
+  end
+
+  local meiProxy, targetDesc, slot, slotErr
+
+  if plan.rtype == "gt_machine" then
+    if not plan.machine then
+      return false, "gt_machine recipe has no machine name on record"
+    end
+    targetDesc = "machine '"..plan.machine.."'s own interface"
+    local encodedMachine = plan.machine:gsub(" ", "+"):gsub(":", "%%3A")
+    local miRaw, miErr = get("/machine_interface?machine="..encodedMachine)
+    if not miRaw then
+      return false, "machine_interface lookup failed: "..tostring(miErr)
+    end
+    if not miRaw:find('"found"%s*:%s*true') then
+      return false, "no dedicated interface for '"..plan.machine.."': "..(extractStr(miRaw, "reason") or "?")
+    end
+    local addr = extractStr(miRaw, "interface_address")
+    if not addr then
+      return false, "machine_interface response missing interface_address"
+    end
+    local okProxy, proxyOrErr = pcall(component.proxy, addr)
+    if not okProxy or not proxyOrErr then
+      -- NOTE: this fails cleanly (not a crash) if this computer isn't on
+      -- the same OC component network as that interface's Adapter -- a
+      -- real, unverified assumption for the gt_machine path specifically
+      -- (see the big comment block above this section).
+      return false, "could not reach interface "..addr.." from this computer: "..tostring(proxyOrErr)
+    end
+    meiProxy = proxyOrErr
+    dbg("auto-write: UNPROVEN gt_machine path -- targeting "..targetDesc.." (addr "..addr:sub(1,8)..")")
+  else
+    -- crafting_shaped / crafting_shapeless
+    if not AUTO_CRAFT_SCRATCH_INTERFACE then
+      return false, "no AUTO_CRAFT_SCRATCH_INTERFACE configured in config.lua -- see config.example.lua"
+    end
+    targetDesc = "the configured scratch interface"
+    local okProxy, proxyOrErr = pcall(component.proxy, AUTO_CRAFT_SCRATCH_INTERFACE)
+    if not okProxy or not proxyOrErr then
+      return false, "could not reach configured scratch interface: "..tostring(proxyOrErr)
+    end
+    meiProxy = proxyOrErr
+  end
+
+  slot, slotErr = findEmptyPatternSlot(meiProxy)
+  if not slot then
+    return false, "no empty pattern slot on "..targetDesc..": "..tostring(slotErr)
+  end
+
+  dbg("auto-write: writing "..plan.rtype.." pattern for "..jobItem.." onto "..targetDesc..", slot "..slot)
+  local ok, outIdOrReason, outDmg = writePatternToInterface(meiProxy, slot, plan)
+  if not ok then
+    return false, "write failed: "..tostring(outIdOrReason)
+  end
+
+  -- give AE2 a moment to index the new pattern before checking
+  os.sleep(0.5)
+  if not verifyCraftable(outIdOrReason, outDmg) then
+    return false, "wrote pattern but "..outIdOrReason..":"..outDmg.." still isn't in getCraftables() -- AE2 likely rejected it"
+  end
+
+  dbg("auto-write: CONFIRMED -- "..outIdOrReason..":"..outDmg.." now craftable (verified via getCraftables())")
+  return true, nil
+end
+
 -- ── background craft-job polling ──────────────
 -- Claude can queue a craft job (via tools/request_craft.py -> POST
 -- /request_craft) from EITHER the web chat or this terminal -- so this
@@ -433,15 +777,45 @@ local function claimAndStartJobs()
       end
     end
     if not target then
-      dbg("job-poll: no craftable pattern found for "..jobItem)
-      post("/report_job_result", {job_id=jobId, success=false,
-        details="no AE2 craftable pattern found for "..jobItem.." -- is a pattern encoded for it?"})
-      cprint(0xFF4444, "[job] FAILED -- no craftable pattern found for "..jobItem..".")
-      -- this CPU slot goes unused this tick (deliberately simple: move on
-      -- to the NEXT free cpu / next queued job rather than retrying this
-      -- same slot against another job -- the skipped job will just be
-      -- picked up on a later free-cpu slot, this tick or a later one)
-      goto continue_loop
+      dbg("job-poll: no craftable pattern found for "..jobItem..", attempting auto-write...")
+      cprint(0x888888, "[job] No pattern found for "..jobItem.." -- attempting to auto-write one...")
+
+      local wrote, writeErr = tryAutoWritePattern(jobItem)
+      if wrote then
+        dbg("job-poll: auto-write CONFIRMED for "..jobItem..", re-checking craftables for this job")
+        cprint(0x00FF00, "[job] Auto-write succeeded and was verified -- retrying this job.")
+        local okRecheck, recraftables = pcall(me.getCraftables)
+        if okRecheck and recraftables then
+          for _, c in ipairs(recraftables) do
+            local candidateName = c.name
+            if not candidateName then
+              local okStack, stack = pcall(c.getItemStack)
+              if okStack and stack then candidateName = stack.name end
+            end
+            if candidateName == jobItem then
+              target = c
+              break
+            end
+          end
+        end
+      else
+        dbg("job-poll: auto-write did not produce a usable pattern for "..jobItem..": "..tostring(writeErr))
+      end
+
+      if not target then
+        local reason = "no AE2 craftable pattern found for "..jobItem.." -- is a pattern encoded for it? "
+          ..(wrote and "(auto-write reported success but the pattern still isn't usable)"
+                    or ("(auto-write attempt: "..tostring(writeErr)..")"))
+        post("/report_job_result", {job_id=jobId, success=false, details=reason})
+        cprint(0xFF4444, "[job] FAILED -- no craftable pattern found for "..jobItem..".")
+        -- this CPU slot goes unused this tick (deliberately simple: move on
+        -- to the NEXT free cpu / next queued job rather than retrying this
+        -- same slot against another job -- the skipped job will just be
+        -- picked up on a later free-cpu slot, this tick or a later one)
+        goto continue_loop
+      end
+
+      cprint(0x00FFFF, "[job] Auto-written pattern found -- proceeding with "..jobQty.."x "..jobItem.." on cpu "..freeCpu.name)
     end
 
     do
