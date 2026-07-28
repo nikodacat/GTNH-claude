@@ -34,6 +34,9 @@
 #    GET  /recent_scans         -- Claude (via tools/recent_scans.py) lists recent structured scan-pipeline events
 #    POST /report_interface_seen -- scan_patterns_oc.lua reports EVERY interface it looked at, occupied or not (silent bookkeeping)
 #    GET  /status                -- Claude (via tools/status.py) aggregate dashboard numbers (machines, recipes, queues, scanner visibility)
+#    POST /request_label_scan    -- Claude (via tools/request_label_scan.py) queues an item-LABEL scan (separate from /request_scan's pattern scan)
+#    GET  /next_label_scan       -- crafting OC computer's background poll: claim the oldest queued label-scan request
+#    POST /report_label_scan_result -- crafting OC computer reports a claimed label scan's outcome
 # =============================================
 
 import http.server
@@ -490,6 +493,44 @@ def save_pending_scans():
     with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(pending_scans, f, ensure_ascii=False, indent=2)
     os.replace(tmp_path, PENDING_SCANS_PATH)
+
+
+# ── item-LABEL scan request queue (pending_label_scans.json) ────────────
+# User's ask (2026-07-24): "the server claude can't seem to run [scan_labels]"
+# -- true, and unavoidably so as originally built: `scan_labels` was a
+# manually-TYPED command in craft_oc.lua's own local chat loop (see that
+# file's "elseif input:lower()=='scan_labels' then" branch), which calls
+# me.getItemsInNetwork() -- a LIVE AE2 call that only exists on the OC
+# computer actually wired into the ME network. claude_test.py (this PC
+# server, where the deployed Claude's subprocess actually runs) has no
+# access to the live game world at all -- it only ever RECEIVES HTTP
+# requests from OC computers, it can never reach out and call an OC API
+# itself. So there was no way to make this literally "server-side" -- the
+# real fix is the same indirection already used for ME-interface pattern
+# scans (pending_scans.json above) and craft jobs (pending_jobs.json):
+# Claude queues a REQUEST here, craft_oc.lua's own background poll (same
+# computer that already runs `scan_labels` manually, since it's the one
+# with the `me` proxy) picks it up and runs the exact same underlying
+# logic, no typing required from a player.
+PENDING_LABEL_SCANS_PATH = "pending_label_scans.json"
+pending_label_scans = {}   # scan_id -> {id, status, requested_at, result}
+pending_label_scans_lock = threading.Lock()
+
+def load_pending_label_scans():
+    global pending_label_scans
+    if not os.path.exists(PENDING_LABEL_SCANS_PATH):
+        print(f"[~] {PENDING_LABEL_SCANS_PATH} not found -- starting with an empty label-scan queue.")
+        return
+    with open(PENDING_LABEL_SCANS_PATH, "r", encoding="utf-8") as f:
+        pending_label_scans = json.load(f)
+    print(f"[~] Loaded pending_label_scans.json: {len(pending_label_scans):,} label-scan request(s) on record.")
+
+def save_pending_label_scans():
+    """Write pending_label_scans back to disk. Caller must hold pending_label_scans_lock."""
+    tmp_path = PENDING_LABEL_SCANS_PATH + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(pending_label_scans, f, ensure_ascii=False, indent=2)
+    os.replace(tmp_path, PENDING_LABEL_SCANS_PATH)
 
 
 # ── recent scan-event feed (scan_events.json) ───────────────────────────
@@ -1118,7 +1159,7 @@ def check_claude():
 # their own context. See tools/*.py for the actual scripts -- each is a
 # thin wrapper around an existing server endpoint, so there's exactly
 # one implementation of each lookup no matter who calls it.
-CRAFT_TOOLS_SYSTEM = """You have access to fourteen command-line tools (run them with your Bash tool, exactly as shown -- nothing else is permitted):
+CRAFT_TOOLS_SYSTEM = """You have access to fifteen command-line tools (run them with your Bash tool, exactly as shown -- nothing else is permitted):
   python tools/resolve_item.py <name>              -- resolve an item name/label (English or otherwise -- translate it yourself first if needed) to candidate item ids
   python tools/get_recipe.py <item_id>              -- look up recipe_db.json recipes for an exact item id
   python tools/machine_recipes.py <machine name> [limit] -- list all recipes learned for a specific machine (e.g. "Assembly Line"); limit defaults to 100
@@ -1133,6 +1174,7 @@ CRAFT_TOOLS_SYSTEM = """You have access to fourteen command-line tools (run them
   python tools/describe_machine.py "<machine name>" "<description>" -- write/update a machine's free-text description (see below; BOTH args must be quoted)
   python tools/recent_scans.py [limit]              -- list recent structured scan-pipeline events (see below); limit defaults to 20
   python tools/status.py                            -- aggregate dashboard numbers: total machines/recipes, queue sizes, scanner visibility (see below)
+  python tools/request_label_scan.py                -- QUEUE a full ME-network item-label scan (does NOT run it instantly -- see below)
 
 IMPORTANT: always run these with `python`, never `python3`. On this machine, `python3` resolves to a broken Windows Store redirect stub that silently exits with no output whenever it's run non-interactively -- it will look like the tool did nothing, with no error to explain why. `python` is the one that actually works.
 
@@ -1174,7 +1216,12 @@ About recent_scans.py -- knowing what happened in recent scans without being tol
 About status.py -- dashboard numbers, and diagnosing "my new machine didn't show up":
 - Call this for any "how many machines/recipes are there," "what's the status of things," or general health-check style question -- it returns total known machines (with names), total recipes (split crafting-table vs GT machine), interface/queue backlog sizes, and the last scan's outcome, all in one call.
 - CRITICALLY, use the "scanner_visibility" section whenever a player says a new machine or interface isn't showing up after a scan -- do NOT guess about cables, power, or channels as the first move. Check "seen_but_never_had_a_pattern_reported" first: if the interface_address the player means IS in that list, the scanner genuinely CAN see it -- the interface is connected and the network path works, it just has no pattern encoded into any of its slots yet, so tell the player exactly that (encode/place a pattern in the interface, then ask for another scan) rather than asking them to check wiring. If an interface_address is NOT anywhere in "scanner_visibility" at all (not in known_machine_names, not in seen_but_never_had_a_pattern_reported), THEN it's a real connectivity question worth asking about -- the scanner has never seen it at all, at any point, occupied or not.
-- TIMING, easy to get wrong: if you just queued a scan with request_scan.py THIS SAME TURN, do not also call status.py right away and treat its numbers as reflecting that scan -- the scan hasn't run yet (it's picked up by a separate background poll, same as request_scan.py's own note above), so status.py at that moment only reflects whatever the LAST scan already recorded, which can be stale or even show 0 if the server was recently restarted and no scan has completed since. Wait for the separate "Pattern scan ... complete" chat message before drawing any conclusion from status.py about newly-added hardware -- if you check too early and see an unexpectedly low or zero scanner_visibility count, say the scan is still in progress and you'll check again once it reports done, don't declare a connectivity problem from stale data."""
+- TIMING, easy to get wrong: if you just queued a scan with request_scan.py THIS SAME TURN, do not also call status.py right away and treat its numbers as reflecting that scan -- the scan hasn't run yet (it's picked up by a separate background poll, same as request_scan.py's own note above), so status.py at that moment only reflects whatever the LAST scan already recorded, which can be stale or even show 0 if the server was recently restarted and no scan has completed since. Wait for the separate "Pattern scan ... complete" chat message before drawing any conclusion from status.py about newly-added hardware -- if you check too early and see an unexpectedly low or zero scanner_visibility count, say the scan is still in progress and you'll check again once it reports done, don't declare a connectivity problem from stale data.
+
+About request_label_scan.py -- refreshing item display-name lookups:
+- This is a COMPLETELY SEPARATE thing from request_scan.py -- request_scan.py finds new/changed MACHINE PATTERNS via the dedicated scanning computer; request_label_scan.py sweeps the whole ME network for item id<->display-name pairs (used by resolve_item.py) via the crafting computer. Don't confuse the two, and don't call one when the player means the other -- "scan for new machines" means request_scan.py, "why doesn't it recognize the name I typed" or "refresh item names"/"update labels" means request_label_scan.py.
+- Same async shape as request_craft.py/request_scan.py: this only QUEUES the scan, it does NOT run instantly -- the crafting OC computer's own background poll picks it up (not this same turn), and completion is reported back separately as its own chat message ("Item label scan ... complete: N new, M changed, T total known labels" or similar). Tell the player it's queued, never that it's done.
+- Use this when a player says an item name isn't being recognized (resolve_item.py keeps failing to find something they know exists), or when they've added new items to the network and want name lookups to reflect them -- not something to run routinely or unprompted, since a full network sweep is relatively expensive and was deliberately kept rare even before this queue existed."""
 
 # ── call claude -p ────────────────────────────────────────────
 def ask_claude(messages, system=None):
@@ -1187,7 +1234,7 @@ def ask_claude(messages, system=None):
     parts.append("[Assistant]\n(reply below)")
     prompt = "\n\n".join(parts)
 
-    # Scoped to exactly these 14 scripts -- Claude cannot run arbitrary Bash
+    # Scoped to exactly these 15 scripts -- Claude cannot run arbitrary Bash
     # commands, only these specific invocations. Both "python3" and
     # "python" prefixes are allowlisted, but CRAFT_TOOLS_SYSTEM above tells
     # Claude to always use "python": on this Windows deployment "python3"
@@ -1196,7 +1243,7 @@ def ask_claude(messages, system=None):
     # see anthropics/claude-code#57946. Keeping the "python3" allowlist
     # entries around is harmless (they're just never used in practice) in
     # case a future machine's PATH ordering differs.
-    craft_tool_scripts = ["resolve_item.py", "get_recipe.py", "machine_recipes.py", "craft_plan.py", "request_craft.py", "label_machine.py", "request_scan.py", "unlabel_machine.py", "remove_recipe.py", "mark_importer.py", "sort_pattern.py", "describe_machine.py", "recent_scans.py", "status.py"]
+    craft_tool_scripts = ["resolve_item.py", "get_recipe.py", "machine_recipes.py", "craft_plan.py", "request_craft.py", "label_machine.py", "request_scan.py", "unlabel_machine.py", "remove_recipe.py", "mark_importer.py", "sort_pattern.py", "describe_machine.py", "recent_scans.py", "status.py", "request_label_scan.py"]
     allowed_tools = []
     for script in craft_tool_scripts:
         allowed_tools.append(f"Bash(python3 tools/{script}:*)")
@@ -2195,6 +2242,27 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         print(f"[scan-job][err] failed to save pending_scans.json: {e}")
                     self.send_json(200, {"scan": scan})
 
+        elif self.path.startswith("/next_label_scan"):
+            # craft_oc.lua's background poll (see that file's
+            # checkForLabelScanRequest()) -- claims the oldest still-queued
+            # item-LABEL scan request. Separate queue/file from /next_scan
+            # above (that one's for the OTHER computer's ME-interface
+            # PATTERN scans) -- see pending_label_scans.json's comment for
+            # why these can't share a queue.
+            with pending_label_scans_lock:
+                candidates = [s for s in pending_label_scans.values() if s.get("status") == "queued"]
+                candidates.sort(key=lambda s: s.get("requested_at", ""))
+                if not candidates:
+                    self.send_json(200, {"scan": None})
+                else:
+                    scan = candidates[0]
+                    scan["status"] = "in_progress"
+                    try:
+                        save_pending_label_scans()
+                    except Exception as e:
+                        print(f"[label-scan-job][err] failed to save pending_label_scans.json: {e}")
+                    self.send_json(200, {"scan": scan})
+
         elif self.path.startswith("/recent_scans"):
             # Claude (via tools/recent_scans.py) -- structured recent scan
             # activity, see scan_events.json's comment above for why this
@@ -2265,6 +2333,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         if self.path == "/report_labels":
             self.handle_report_labels()
+            return
+
+        if self.path == "/request_label_scan":
+            self.handle_request_label_scan()
+            return
+
+        if self.path == "/report_label_scan_result":
+            self.handle_report_label_scan_result()
             return
 
         if self.path == "/request_craft":
@@ -3118,6 +3194,69 @@ class Handler(http.server.BaseHTTPRequestHandler):
             "new": new_count, "changed": changed_count, "total": total,
         })
 
+    def handle_request_label_scan(self):
+        """Called by tools/request_label_scan.py -- Claude queuing an item-
+        LABEL scan (see pending_label_scans.json's comment above for why
+        this indirection exists at all). Same shape as handle_request_scan
+        (the ME-interface PATTERN scan queue) but a completely separate
+        queue/file -- these are two different things craft_oc.lua and
+        scan_patterns_oc.lua each do, on two different computers, and
+        mixing their queues would make "which computer should pick this
+        up" ambiguous."""
+        length = int(self.headers.get("Content-Length", 0))
+        if length:
+            self.rfile.read(length)
+
+        scan_id = uuid.uuid4().hex[:10]
+        now = time.strftime("%Y-%m-%d %H:%M:%S")
+        with pending_label_scans_lock:
+            pending_label_scans[scan_id] = {
+                "id": scan_id, "status": "queued", "requested_at": now, "result": None,
+            }
+            try:
+                save_pending_label_scans()
+            except Exception as e:
+                print(f"[label-scan-job][err] failed to save pending_label_scans.json: {e}")
+                append_log("error", f"failed to save pending_label_scans.json: {e}")
+
+        append_log("diag", f"Item label scan queued (scan {scan_id}) -- waiting for the crafting computer to pick it up.")
+        self.send_json(200, {"queued": True, "scan_id": scan_id})
+
+    def handle_report_label_scan_result(self):
+        """craft_oc.lua reports the outcome of a label scan it claimed via
+        GET /next_label_scan. The actual id/label DATA already went to
+        POST /report_labels (unchanged, existing endpoint) right before
+        this -- this call is purely "the scan itself finished, here's the
+        overall outcome," same split as pattern scans (/report_pattern for
+        data, /report_scan_result for the queue entry)."""
+        data, err = self._read_json_body()
+        if err:
+            self.send_json(400, {"error": err})
+            return
+
+        scan_id = data.get("scan_id")
+        success = bool(data.get("success", False))
+        details = data.get("details", "")
+
+        with pending_label_scans_lock:
+            scan = pending_label_scans.get(scan_id)
+            if not scan:
+                self.send_json(404, {"error": "unknown scan_id"})
+                return
+            scan["status"] = "done" if success else "failed"
+            scan["result"] = details
+            try:
+                save_pending_label_scans()
+            except Exception as e:
+                print(f"[label-scan-job][err] failed to save pending_label_scans.json: {e}")
+                append_log("error", f"failed to save pending_label_scans.json: {e}")
+
+        verb = "complete" if success else "FAILED"
+        msg = f"Item label scan {scan_id} {verb}: {details}" if details else f"Item label scan {scan_id} {verb}."
+        print(f"[label-scan-job] {msg}")
+        append_log("claude", msg)
+        self.send_json(200, {"status": "ok"})
+
     # ── crafting job queue endpoints ─────────────────────────────
     def handle_request_craft(self):
         """Called by tools/request_craft.py, which Claude invokes when it
@@ -3439,6 +3578,7 @@ if __name__ == "__main__":
     load_item_labels()
     load_pending_jobs()
     load_pending_scans()
+    load_pending_label_scans()
     load_scan_events()
     load_interface_meta()
     load_seen_interfaces()
