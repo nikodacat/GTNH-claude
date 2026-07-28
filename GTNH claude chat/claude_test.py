@@ -37,6 +37,8 @@
 #    POST /request_label_scan    -- Claude (via tools/request_label_scan.py) queues an item-LABEL scan (separate from /request_scan's pattern scan)
 #    GET  /next_label_scan       -- crafting OC computer's background poll: claim the oldest queued label-scan request
 #    POST /report_label_scan_result -- crafting OC computer reports a claimed label scan's outcome
+#    GET  /machine_interface     -- machine name -> its dedicated interface_address (for auto-pattern-write's gt_machine targeting)
+#    GET  /pattern_write_plan    -- normalized {inputs[],output,rtype,machine} plan for auto-writing an AE2 pattern (craft_oc.lua's tryAutoWritePattern())
 # =============================================
 
 import http.server
@@ -2089,6 +2091,131 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     "items"      : items,
                     "description": note.get("description") if note else None,
                 })
+
+        elif self.path.startswith("/machine_interface"):
+            # /machine_interface?machine=Assembly+Line -- reverse lookup,
+            # machine NAME -> its dedicated interface_address, for the
+            # auto-pattern-write feature (craft_oc.lua's
+            # tryAutoWritePattern(), 2026-07-24): a gt_machine recipe's
+            # AE2 processing pattern has to be written onto the specific
+            # physical interface wired to that exact machine, not any
+            # spare slot -- this is how the OC side finds which address
+            # that is. Only ever resolves to a machine with its OWN
+            # dedicated interface_meta entry (one real interface = one
+            # real machine, the normal labeling flow) -- an importer-only
+            # machine (reachable only through the wildcard importer, see
+            # WILDCARD_MACHINE) has NO single physical interface of its
+            # own to target and correctly 404s here, distinctly from "not
+            # a known machine at all."
+            machine = None
+            if "machine=" in self.path:
+                machine = self.path.split("machine=")[1].split("&")[0]
+                machine = machine.replace("%3A", ":").replace("+", " ")
+            if not machine:
+                self.send_json(400, {"error": "missing ?machine= parameter"})
+            else:
+                with interface_meta_lock:
+                    match = None
+                    for entry in interface_meta.values():
+                        m = entry.get("machine")
+                        if m and m != WILDCARD_MACHINE and m.lower() == machine.lower():
+                            match = entry
+                            break
+                if match:
+                    self.send_json(200, {
+                        "found": True,
+                        "machine": match.get("machine"),
+                        "interface_address": match.get("interface_address"),
+                        "interface_label": match.get("interface_label"),
+                    })
+                else:
+                    known = get_known_machine_names()
+                    is_known_but_importer_only = any(m.lower() == machine.lower() for m in known)
+                    suggestions = difflib.get_close_matches(machine, known, n=3, cutoff=0.5)
+                    self.send_json(404, {
+                        "found": False,
+                        "you_said": machine,
+                        "reason": (
+                            "known machine, but no dedicated physical interface on record -- "
+                            "it's only ever been reached through the wildcard importer, so "
+                            "there's no single real interface to target"
+                        ) if is_known_but_importer_only else "not a known machine name",
+                        "did_you_mean": suggestions[0] if suggestions and not is_known_but_importer_only else None,
+                        "known_machines": known,
+                    })
+
+        elif self.path.startswith("/pattern_write_plan"):
+            # /pattern_write_plan?item=gregtech:gt.metaitem.01:2311 --
+            # normalized "what to write into an AE2 pattern slot" plan for
+            # craft_oc.lua's tryAutoWritePattern() (2026-07-24 auto-pattern-
+            # write feature). Exists because recipe_db.json's own on-disk
+            # shape is NOT uniform enough for Lua to parse directly with the
+            # existing regex-based extractStr/extractArr helpers: crafting_
+            # shaped/shapeless store plain ingredient-id STRINGS in "grid"/
+            # "ingredients" (no per-entry count -- one grid slot per
+            # occurrence, see get_ingredient_counts()'s own comment on why
+            # that must NOT be aggregated), while gt_machine stores
+            # "item_inputs" as an array of {"item","count"} OBJECTS (and
+            # processing patterns DO want aggregated counts per distinct
+            # item, unlike crafting). Rather than teach Lua two different
+            # object-array parsers, this endpoint reuses the exact same
+            # select_recipe()/get_ingredient_counts()/get_recipe_output_
+            # count() helpers the craft-tree planner already trusts, and
+            # emits ONE flat, uniform shape either way: an "inputs" array of
+            # {"index","entry","count"} objects (fixed key order, so the OC
+            # side's regex parser doesn't need real JSON parsing). "entry"
+            # is still a raw ingredient id/ore: tag string -- resolving
+            # ore: tags against live network stock stays OC-side (that's
+            # what resolveOreTag()/resolveEntry() in the Lua deploy scripts
+            # already do, and it needs live network data this server
+            # doesn't have).
+            item = None
+            if "item=" in self.path:
+                item = self.path.split("item=")[1].split("&")[0]
+                item = item.replace("%3A", ":").replace("+", " ")
+            if not item:
+                self.send_json(400, {"error": "missing ?item= parameter"})
+            elif not recipe_db:
+                self.send_json(503, {"error": "recipe DB not loaded"})
+            else:
+                candidates = recipe_db.get(item) or []
+                if not candidates:
+                    self.send_json(200, {"found": False, "item": item,
+                                          "reason": "no recipe in recipe_db.json"})
+                else:
+                    recipe = select_recipe(candidates)
+                    rtype = recipe.get("type") if recipe else None
+                    if rtype not in ("crafting_shaped", "crafting_shapeless", "gt_machine"):
+                        self.send_json(200, {"found": False, "item": item,
+                                              "reason": f"unsupported recipe type: {rtype}"})
+                    else:
+                        inputs = []
+                        if rtype == "crafting_shaped":
+                            for i, entry in enumerate(recipe.get("grid") or [], start=1):
+                                if entry:
+                                    inputs.append({"index": i, "entry": entry, "count": 1})
+                        elif rtype == "crafting_shapeless":
+                            for i, entry in enumerate(recipe.get("ingredients") or [], start=1):
+                                if entry:
+                                    inputs.append({"index": i, "entry": entry, "count": 1})
+                        else:  # gt_machine -- aggregated counts are correct here (processing
+                               # pattern slots are per-distinct-item, unlike crafting grid slots)
+                            for i, (entry, count) in enumerate(get_ingredient_counts(recipe), start=1):
+                                inputs.append({"index": i, "entry": entry, "count": count})
+
+                        requires_fluid = rtype == "gt_machine" and bool(
+                            recipe.get("fluid_inputs") or recipe.get("fluid_outputs"))
+
+                        self.send_json(200, {
+                            "found"        : True,
+                            "item"         : item,
+                            "rtype"        : rtype,
+                            "machine"      : recipe.get("machine") if rtype == "gt_machine" else None,
+                            "inputs"       : inputs,
+                            "output_entry" : item,
+                            "output_count" : get_recipe_output_count(recipe),
+                            "requires_fluid": requires_fluid,
+                        })
 
         elif self.path.startswith("/search"):
             # /search?q=iron_ingot&limit=10
