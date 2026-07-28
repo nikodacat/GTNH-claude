@@ -53,6 +53,19 @@ PORT       = 11434
 CLAUDE_PATH = os.environ.get("CLAUDE_CLI_PATH", "claude")
 CRAFT_TOOL_TIMEOUT_S = 180  # see ask_claude()'s comment for why this isn't 90 anymore
 
+# TEMPORARY (2026-07-24, user's own call): pinned to "sonnet" for a coding/
+# debugging-heavy stretch -- some of the OC-script/Python debugging in this
+# project goes better with a stronger coding model than whatever the CLI's
+# own unpinned default happens to be. Passed as --model on both `claude -p`
+# calls below (ask_claude() and ask_claude_vision()). "sonnet" is a Claude
+# Code CLI alias (confirmed via `claude --help`), not a specific dated
+# model string -- it always resolves to the latest Sonnet the CLI knows
+# about, so this doesn't go stale on its own.
+# TO REVERT: set this back to None (both subprocess.run calls below already
+# skip --model entirely when this is None/falsy) to return to whatever the
+# CLI's own default model is.
+CLAUDE_MODEL = "sonnet"
+
 # Debug log for the underlying `claude -p` subprocess -- overwritten on every
 # call (not per-call unique) so there's always exactly one file to check.
 # `--debug-file` implicitly turns on Claude Code's debug logging, which
@@ -389,6 +402,18 @@ def find_items_by_label(query, limit=10):
     results = []
     for id_meta, label in item_labels.items():
         if q in label.lower():
+            results.append({"id_meta": id_meta, "label": label})
+            if len(results) >= limit:
+                break
+    return results
+
+def find_labels_by_id(query, limit=10):
+    """Case-insensitive substring search over item_labels' keys (item IDs).
+    Returns [{"id_meta": "modid:name:meta", "label": "..."}, ...]."""
+    q = query.lower()
+    results = []
+    for id_meta, label in item_labels.items():
+        if q in id_meta.lower():
             results.append({"id_meta": id_meta, "label": label})
             if len(results) >= limit:
                 break
@@ -1018,8 +1043,12 @@ def ask_claude_vision(image_abs_path):
               + "\n\nImage file path (read this file with your Read tool):\n"
               + image_abs_path)
     try:
+        cmd = [CLAUDE_PATH, "-p", prompt, "--permission-mode", "bypassPermissions", "--debug-file", CLAUDE_DEBUG_LOG]
+        if CLAUDE_MODEL:
+            cmd += ["--model", CLAUDE_MODEL]
+        cmd += ["--allowedTools", "Read"]
         result = subprocess.run(
-            [CLAUDE_PATH, "-p", prompt, "--permission-mode", "bypassPermissions", "--debug-file", CLAUDE_DEBUG_LOG, "--allowedTools", "Read"],
+            cmd,
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -1183,8 +1212,12 @@ def ask_claude(messages, system=None):
     # ever needs adjusting a second time.
     start = time.monotonic()
     try:
+        cmd = [CLAUDE_PATH, "-p", prompt, "--permission-mode", "bypassPermissions", "--debug-file", CLAUDE_DEBUG_LOG]
+        if CLAUDE_MODEL:
+            cmd += ["--model", CLAUDE_MODEL]
+        cmd += ["--allowedTools"] + allowed_tools
         result = subprocess.run(
-            [CLAUDE_PATH, "-p", prompt, "--permission-mode", "bypassPermissions", "--debug-file", CLAUDE_DEBUG_LOG, "--allowedTools"] + allowed_tools,
+            cmd,
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -2105,6 +2138,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 try: limit = int(self.path.split("limit=")[1].split("&")[0])
                 except: limit = 10
             results = find_items_by_label(query, limit) if query else []
+            self.send_json(200, {"query": query, "found": len(results) > 0, "count": len(results), "results": results})
+
+        elif self.path.startswith("/lookup_label"):
+            # /lookup_label?q=gt.metaitem.01:2311&limit=5
+            # ID (substring) -> label lookup, built from item_labels.json.
+            # Complement of /resolve_name (which goes label->id).
+            query = ""
+            limit = 10
+            if "q=" in self.path:
+                query = self.path.split("q=")[1].split("&")[0]
+                query = query.replace("%3A", ":").replace("+", " ")
+            if "limit=" in self.path:
+                try: limit = int(self.path.split("limit=")[1].split("&")[0])
+                except: limit = 10
+            results = find_labels_by_id(query, limit) if query else []
             self.send_json(200, {"query": query, "found": len(results) > 0, "count": len(results), "results": results})
 
         elif self.path.startswith("/next_job"):
