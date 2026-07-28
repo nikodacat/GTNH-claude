@@ -463,11 +463,117 @@ local function claimAndStartJobs()
   end
 end
 
+-- ── item-label scan (shared by the manual "scan_labels" command AND ──
+-- the background label-scan-request poll below) ───────────────────────
+-- Extracted 2026-07-24 (user's ask: "the server claude can't seem to run
+-- [scan_labels]") -- this used to be inline in the manual command only,
+-- reachable exclusively by a player physically typing "scan_labels" at
+-- this terminal. Claude has no access to the live game world at all
+-- (see claude_test.py's pending_label_scans.json comment for the full
+-- explanation), so making this genuinely "server-side" isn't possible --
+-- instead this same logic is now callable from a background poll too,
+-- so Claude can QUEUE a request that this computer picks up on its own,
+-- no typing required. Returns
+-- (ok, entryCount, newCount, changedCount, totalCount, errMsg):
+--   ok=false -> getItemsInNetwork() or the /report_labels POST itself
+--               failed; errMsg has the reason, other numbers are 0
+--   ok=true  -> counts are meaningful (newCount/changedCount/totalCount
+--               default to 0/entryCount if the server's response didn't
+--               parse cleanly, which shouldn't normally happen)
+local function runLabelScan()
+  local ok, items = pcall(me.getItemsInNetwork)
+  if not ok or not items then
+    return false, 0, 0, 0, 0, "getItemsInNetwork failed: "..tostring(items)
+  end
+
+  local entries = {}
+  for _, it in ipairs(items) do
+    if it.name and it.label then
+      entries[#entries+1] = {id = it.name, damage = it.damage or 0, label = it.label}
+    end
+  end
+
+  local raw, perr = post("/report_labels", {entries=entries})
+  if not raw then
+    return false, #entries, 0, 0, 0, "report failed: "..(perr or "?")
+  end
+
+  local newCount     = extractNum(raw, "new") or 0
+  local changedCount = extractNum(raw, "changed") or 0
+  local totalCount   = extractNum(raw, "total") or #entries
+  return true, #entries, newCount, changedCount, totalCount, nil
+end
+
+-- ── background item-label-scan request poll ───
+-- Claude queues one via tools/request_label_scan.py -> POST
+-- /request_label_scan; this polls GET /next_label_scan for one, on the
+-- SAME jobPollTick() cadence as the craft-job poll below (piggybacked
+-- onto the existing timer rather than a second one -- label scans are
+-- rare, no need for their own schedule). Repeat-suppression on
+-- persistent poll failures follows the exact pattern already fixed in
+-- scan_patterns_oc.lua's checkForScanRequest() (see that file's
+-- 2026-07-24 history) -- first occurrence logs immediately, then only
+-- every 100th repeat, resetting the moment a healthy response comes back.
+local lastLabelScanPollProblem = nil
+local lastLabelScanPollProblemCount = 0
+local function reportLabelScanPollProblem(msg)
+  if msg == lastLabelScanPollProblem then
+    lastLabelScanPollProblemCount = lastLabelScanPollProblemCount + 1
+    if lastLabelScanPollProblemCount % 100 == 0 then
+      dbg("label-scan-poll: (still failing, "..lastLabelScanPollProblemCount.." consecutive) "..msg)
+      flushDebug("label-scan-poll-repeat")
+    end
+    return
+  end
+  lastLabelScanPollProblem = msg
+  lastLabelScanPollProblemCount = 1
+  dbg("label-scan-poll: "..msg)
+  flushDebug("label-scan-poll-problem")
+end
+
+local function checkForLabelScanRequest()
+  local raw, err = get("/next_label_scan", true)  -- quiet: fires every JOB_POLL_INTERVAL forever, don't trace routine HTTP
+  if not raw then
+    reportLabelScanPollProblem("/next_label_scan failed: "..(err or "?"))
+    return
+  end
+  if raw:find('"scan"%s*:%s*null') then
+    lastLabelScanPollProblem, lastLabelScanPollProblemCount = nil, 0  -- healthy -- next failure logs immediately
+    return  -- nothing queued right now
+  end
+
+  local scanId = extractStr(raw, "id")
+  if not scanId then
+    reportLabelScanPollProblem("malformed /next_label_scan response: "..raw:sub(1,200))
+    return
+  end
+
+  lastLabelScanPollProblem, lastLabelScanPollProblemCount = nil, 0
+  dbg("label-scan-poll: claimed label scan request "..scanId)
+  cprint(0x888888, "\n[label-scan] Running a queued item-label scan (requested by Claude)...")
+
+  local ok, entryCount, newCount, changedCount, totalCount, errMsg = runLabelScan()
+  if not ok then
+    dbg("label-scan-poll: "..tostring(errMsg))
+    cprint(0xFF4444, "[label-scan] FAILED: "..tostring(errMsg))
+    post("/report_label_scan_result", {scan_id=scanId, success=false, details=tostring(errMsg)})
+  else
+    local details = string.format("%d new, %d changed, %d total known (from %d labeled item(s) found)",
+      newCount, changedCount, totalCount, entryCount)
+    dbg("label-scan-poll: "..details)
+    cprint(0x00FF00, "[label-scan] done -- "..details)
+    post("/report_label_scan_result", {scan_id=scanId, success=true, details=details})
+  end
+  flushDebug("label-scan-poll-complete")
+end
+
 local function jobPollTick()
   local ok1, e1 = pcall(pollActiveCraftJobs)
   if not ok1 then dbg("pollActiveCraftJobs errored: "..tostring(e1)) end
   local ok2, e2 = pcall(claimAndStartJobs)
   if not ok2 then dbg("claimAndStartJobs errored: "..tostring(e2)) end
+  local ok3, e3 = pcall(checkForLabelScanRequest)
+  if not ok3 then dbg("checkForLabelScanRequest errored: "..tostring(e3)) end
 end
 
 -- ── recipe lookup ─────────────────────────────
@@ -596,47 +702,31 @@ while true do
     flushDebug("search-"..q)
 
   elseif input:lower()=="scan_labels" then
-    -- Deliberately a manual, explicitly-triggered command -- NOT run
-    -- automatically on boot or per-request. me.getItemsInNetwork() with
-    -- no filter enumerates the WHOLE ME network; buildInventory() above
-    -- already calls it every craft request for item counts, but this
-    -- command additionally captures each item's .label and reports the
+    -- Manual, explicitly-triggered version of the exact same scan the
+    -- background poll can now also run on Claude's behalf (see
+    -- runLabelScan()'s comment above, and tools/request_label_scan.py) --
+    -- both paths share runLabelScan() so there's exactly one
+    -- implementation of the actual scan logic. me.getItemsInNetwork()
+    -- with no filter enumerates the WHOLE ME network; buildInventory()
+    -- above already calls it every craft request for item counts, but
+    -- this additionally captures each item's .label and reports the
     -- id->label pairs to the server so it can build a persistent,
     -- reusable name index (item_labels.json) -- see claude_test.py's
-    -- handle_report_labels(). Keeping this a manual command (rather than
-    -- doing the label-capture-and-report every time buildInventory()
-    -- runs) is what keeps the extra network-wide sweep + upload rare.
+    -- handle_report_labels().
     dbg("scan_labels command")
     cwrite(0x888888,"[~] Scanning ME network for item labels (may take a moment)... ")
-    local ok, items = pcall(me.getItemsInNetwork)
-    if not ok or not items then
-      cprint(0xFF4444, "failed: "..tostring(items))
-      dbg("scan_labels: getItemsInNetwork failed: "..tostring(items))
+    local ok, entryCount, newCount, changedCount, totalCount, errMsg = runLabelScan()
+    if not ok then
+      cprint(0xFF4444, "failed: "..tostring(errMsg))
+      dbg("scan_labels: "..tostring(errMsg))
       flushDebug("scan-labels-fail")
     else
-      local entries = {}
-      for _, it in ipairs(items) do
-        if it.name and it.label then
-          entries[#entries+1] = {id = it.name, damage = it.damage or 0, label = it.label}
-        end
-      end
-      cprint(0x00FF00, "done. "..#entries.." labeled item(s) found. Reporting to server...")
-      dbg("scan_labels: reporting "..#entries.." entries")
-      local raw, perr = post("/report_labels", {entries=entries})
-      if not raw then
-        cprint(0xFF4444, "[ERR] report failed: "..(perr or "?"))
-        dbg("scan_labels: report failed: "..(perr or "?"))
-        flushDebug("scan-labels-report-fail")
-      else
-        local newCount     = extractNum(raw, "new") or 0
-        local changedCount = extractNum(raw, "changed") or 0
-        local totalCount   = extractNum(raw, "total") or #entries
-        cprint(0x00FFFF, string.format(
-          "[OK] label db updated -- %d new, %d changed, %d total known.",
-          newCount, changedCount, totalCount))
-        dbg("scan_labels: report ok -- "..newCount.." new, "..changedCount.." changed, "..totalCount.." total")
-        flushDebug("scan-labels-ok")
-      end
+      cprint(0x00FF00, "done. "..entryCount.." labeled item(s) found. Reporting to server...")
+      cprint(0x00FFFF, string.format(
+        "[OK] label db updated -- %d new, %d changed, %d total known.",
+        newCount, changedCount, totalCount))
+      dbg("scan_labels: report ok -- "..newCount.." new, "..changedCount.." changed, "..totalCount.." total")
+      flushDebug("scan-labels-ok")
     end
 
   else
